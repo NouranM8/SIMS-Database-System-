@@ -1,0 +1,607 @@
+"""
+seed.py — SIMS realistic data seeder.
+
+SAFE / IDEMPOTENT: checks if data already exists and skips gracefully.
+This is a real system — data is never wiped by the seeder.
+Run only on a fresh/empty database. If students already exist, the
+script exits with a clear message and touches nothing.
+"""
+
+import mysql.connector
+import hashlib, random, string, sys
+from datetime import date, timedelta
+from collections import defaultdict
+
+# ── CONNECTION ────────────────────────────────────────────────────
+conn = mysql.connector.connect(
+    host="localhost", user="root",
+    password="sondos",   # ← change this
+    database="sims",
+    autocommit=True,
+)
+cur = conn.cursor()
+
+def h(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def genpw():
+    c = random.choices(string.ascii_lowercase, k=4) + random.choices(string.digits, k=4)
+    random.shuffle(c)
+    return "".join(c)
+
+# ── GRADE WEIGHT CONSTANTS (must match logic.py) ──────────────────
+MAX_QUIZ1   = 10
+MAX_QUIZ2   = 10
+MAX_MIDTERM = 20
+MAX_FINAL   = 60
+MAX_TOTAL   = MAX_QUIZ1 + MAX_QUIZ2 + MAX_MIDTERM + MAX_FINAL   # 100
+PASS_RAW    = int(MAX_TOTAL * 0.60)   # 60
+
+def letter_from_pct(pct):
+    if pct >= 90: return "A"
+    if pct >= 80: return "B"
+    if pct >= 70: return "C"
+    if pct >= 60: return "D"
+    return "F"
+
+def raw_to_pct(raw):
+    return round(raw, 1)
+
+# ── IDEMPOTENT GUARD ────────────────────────────────────────────
+cur.execute("SELECT COUNT(*) AS n FROM Student")
+student_count = cur.fetchone()[0]
+cur.execute("SELECT COUNT(*) AS n FROM Teacher")
+teacher_count = cur.fetchone()[0]
+
+if student_count > 0:
+    print(f"\n✅ Database already has {student_count} students — seed not needed.")
+    print("   Your data is untouched.\n")
+    cur.close(); conn.close(); sys.exit(0)
+
+if teacher_count > 0:
+    # Partial run (crashed mid-seed) — clear and restart cleanly
+    print("Partial data detected — clearing for a clean seed...")
+    cur.execute("SET FOREIGN_KEY_CHECKS=0")
+    for tbl in ["AnnouncementRead","Announcement","User","GPA","Attendance",
+                "GradeDetail","Grades","Enrollment","Subject","Student",
+                "Guardian","Class","Teacher"]:
+        cur.execute(f"TRUNCATE TABLE {tbl}")
+    cur.execute("SET FOREIGN_KEY_CHECKS=1")
+    print("Tables cleared.")
+
+print("Database is empty. Seeding now...")
+# Commit after each major section — reduces damage from mid-run crashes
+
+# ── 6 ACADEMIC YEARS ─────────────────────────────────────────────
+# Schema already inserted years + semesters — just read them back
+year_labels = ["2020-2021","2021-2022","2022-2023","2023-2024","2024-2025","2025-2026"]
+year_ids = []
+for label in year_labels:
+    cur.execute("INSERT IGNORE INTO AcademicYear (year_name) VALUES (%s)", (label,))
+    cur.execute("SELECT school_year_id FROM AcademicYear WHERE year_name=%s", (label,))
+    year_ids.append(cur.fetchone()[0])
+
+semesters = {}
+for y_id in year_ids:
+    cur.execute("INSERT IGNORE INTO Semester (name,school_year_id) VALUES ('Fall',%s)",   (y_id,))
+    cur.execute("SELECT semester_id FROM Semester WHERE name='Fall'   AND school_year_id=%s", (y_id,))
+    semesters[(y_id,"Fall")]   = cur.fetchone()[0]
+    cur.execute("INSERT IGNORE INTO Semester (name,school_year_id) VALUES ('Spring',%s)", (y_id,))
+    cur.execute("SELECT semester_id FROM Semester WHERE name='Spring' AND school_year_id=%s", (y_id,))
+    semesters[(y_id,"Spring")] = cur.fetchone()[0]
+
+SEM_CURRENT = semesters[(year_ids[5],"Spring")]   # 12 — active, finals pending
+SEM_PREV    = semesters[(year_ids[5],"Fall")]      # 11 — complete
+
+# ── 20 TEACHERS ──────────────────────────────────────────────────
+teacher_data = [
+    ("Ahmed",   "Hassan",   "ahmed.hassan@school.edu",   "0100-111-2001","Male",  date(1980,3,15)),
+    ("Sara",    "Mohamed",  "sara.mohamed@school.edu",   "0100-111-2002","Female",date(1985,7,22)),
+    ("Khaled",  "Ibrahim",  "khaled.ibrahim@school.edu", "0100-111-2003","Male",  date(1978,11,5)),
+    ("Nadia",   "Youssef",  "nadia.youssef@school.edu",  "0100-111-2004","Female",date(1990,1,30)),
+    ("Omar",    "Farouk",   "omar.farouk@school.edu",    "0100-111-2005","Male",  date(1983,6,18)),
+    ("Layla",   "Abdallah", "layla.abdallah@school.edu", "0100-111-2006","Female",date(1987,9,12)),
+    ("Mostafa", "Saad",     "mostafa.saad@school.edu",   "0100-111-2007","Male",  date(1979,4,25)),
+    ("Hana",    "Ramadan",  "hana.ramadan@school.edu",   "0100-111-2008","Female",date(1992,2,8)),
+    ("Youssef", "Mansour",  "youssef.mansour@school.edu","0100-111-2009","Male",  date(1981,12,3)),
+    ("Dina",    "Saleh",    "dina.saleh@school.edu",     "0100-111-2010","Female",date(1986,5,19)),
+    ("Tarek",   "Nasser",   "tarek.nasser@school.edu",   "0100-111-2011","Male",  date(1977,8,27)),
+    ("Eman",    "Fouad",    "eman.fouad@school.edu",     "0100-111-2012","Female",date(1989,10,14)),
+    ("Hassan",  "Zaki",     "hassan.zaki@school.edu",    "0100-111-2013","Male",  date(1984,3,6)),
+    ("Rania",   "Kamel",    "rania.kamel@school.edu",    "0100-111-2014","Female",date(1991,7,23)),
+    ("Mahmoud", "Atef",     "mahmoud.atef@school.edu",   "0100-111-2015","Male",  date(1976,1,11)),
+    ("Yasmin",  "Ghali",    "yasmin.ghali@school.edu",   "0100-111-2016","Female",date(1988,4,29)),
+    ("Amr",     "Shawky",   "amr.shawky@school.edu",     "0100-111-2017","Male",  date(1982,9,7)),
+    ("Noha",    "Hamdy",    "noha.hamdy@school.edu",     "0100-111-2018","Female",date(1993,6,16)),
+    ("Sherif",  "Lotfy",    "sherif.lotfy@school.edu",   "0100-111-2019","Male",  date(1980,11,20)),
+    ("Mona",    "Badr",     "mona.badr@school.edu",      "0100-111-2020","Female",date(1985,2,4)),
+]
+teacher_ids = []
+used_emails = set()
+for t in teacher_data:
+    f, l, email, phone, gender, bdate = t
+    # Make email unique if collision (handles re-runs on partially wiped DB)
+    base_email = email
+    suffix = 1
+    while email in used_emails:
+        email = base_email.replace('@', f'{suffix}@')
+        suffix += 1
+    used_emails.add(email)
+    cur.execute("""INSERT IGNORE INTO Teacher (f_name,l_name,email,phone_no,gender,birth_date)
+                   VALUES (%s,%s,%s,%s,%s,%s)""", (f, l, email, phone, gender, bdate))
+    if cur.lastrowid:
+        teacher_ids.append(cur.lastrowid)
+    else:
+        # Already existed — fetch the id
+        cur.execute("SELECT teacher_id FROM Teacher WHERE email=%s", (email,))
+        teacher_ids.append(cur.fetchone()[0])
+
+specialisation = {
+    teacher_ids[0]: "Mathematics",  teacher_ids[1]: "Mathematics",  teacher_ids[2]: "Mathematics",
+    teacher_ids[3]: "Arabic",       teacher_ids[4]: "Arabic",       teacher_ids[5]: "Arabic",
+    teacher_ids[6]: "English",      teacher_ids[7]: "English",      teacher_ids[8]: "English",
+    teacher_ids[9]: "Science",      teacher_ids[10]:"Science",      teacher_ids[17]:"Science",
+    teacher_ids[11]:"Physics",      teacher_ids[12]:"Physics",      teacher_ids[18]:"Physics",
+    teacher_ids[13]:"Chemistry",    teacher_ids[14]:"Chemistry",    teacher_ids[19]:"Chemistry",
+    teacher_ids[15]:"Physical Education", teacher_ids[16]:"Physical Education",
+}
+teachers_by_subject = defaultdict(list)
+for tid, subj in specialisation.items():
+    teachers_by_subject[subj].append(tid)
+
+# ── 12 CLASSES ────────────────────────────────────────────────────
+classes = []
+for grade in range(7, 13):
+    for section in ["A","B"]:
+        hr = teacher_ids[(grade + ord(section)) % len(teacher_ids)]
+        cur.execute("INSERT INTO Class (grade,section,homeroom_teacher_id) VALUES (%s,%s,%s)",
+                    (grade, section, hr))
+        classes.append((cur.lastrowid, grade, section))
+
+grade_subjects = {
+    7:  ["Mathematics","Science","Arabic","English","Physical Education"],
+    8:  ["Mathematics","Science","Arabic","English","Physical Education"],
+    9:  ["Mathematics","Physics","Arabic","English","Physical Education"],
+    10: ["Mathematics","Physics","Arabic","English","Physical Education"],
+    11: ["Mathematics","Chemistry","Arabic","English","Physical Education"],
+    12: ["Mathematics","Chemistry","Arabic","English","Physical Education"],
+}
+
+def pick_teacher(subj, idx):
+    pool = teachers_by_subject[subj]
+    return pool[idx % len(pool)]
+
+subject_map = {}
+for y_id in year_ids:
+    for sem_name in ["Fall","Spring"]:
+        sem_id = semesters[(y_id, sem_name)]
+        for idx, (class_id, grade, section) in enumerate(classes):
+            for subj_name in grade_subjects[grade]:
+                t_id = pick_teacher(subj_name, idx)
+                cur.execute("INSERT INTO Subject (name,teacher_id,semester_id) VALUES (%s,%s,%s)",
+                            (subj_name, t_id, sem_id))
+                subject_map[(class_id, sem_id, subj_name)] = cur.lastrowid
+
+# ── STUDENTS ─────────────────────────────────────────────────────
+first_m = ["Adam","Youssef","Omar","Karim","Hassan","Ahmed","Ziad","Tarek",
+           "Nour","Hamza","Samer","Faris","Rami","Jad","Bilal","Amir",
+           "Samir","Walid","Khaled","Adel","Mahmoud","Sherif","Amr","Hany","Wael"]
+first_f = ["Nadia","Sara","Layla","Hana","Rana","Dina","Rania","Yasmin",
+           "Mona","Noha","Lina","Maya","Nour","Salma","Heba","Aya",
+           "Reem","Dana","Farah","Mariam","Ola","Nermeen","Ghada","Dalia","Sana"]
+last_names = ["Hassan","Mohamed","Ibrahim","Youssef","Farouk","Abdallah","Saad",
+              "Ramadan","Mansour","Saleh","Nasser","Fouad","Zaki","Kamel",
+              "Atef","Ghali","Shawky","Hamdy","Lotfy","Badr","Khalil",
+              "Ragab","Sobhy","Fathy","Aziz","Wahba","Gaber","Selim","Rizk","Botros"]
+addresses = ["12 Tahrir St, Cairo","45 Nile Corniche, Giza","8 Al-Haram Rd, Giza",
+             "33 Ramses Ave, Cairo","19 October 6 City","7 Maadi Ring Rd, Cairo",
+             "22 Heliopolis Blvd, Cairo","5 Zamalek St, Cairo",
+             "14 Mohandessin St, Giza","31 Nasr City Rd, Cairo"]
+
+# Base start year per grade, with natural ±1 year variation per student
+# Grade 7 = enrolled in 2025 (or 2024 for older students)
+# Grade 12 = enrolled in 2020 (or 2019 for students who repeated)
+grade_base_start_idx = {7: 5, 8: 4, 9: 3, 10: 2, 11: 1, 12: 0}
+
+def get_start_year_idx(grade, status):
+    """Add realistic variation: ~15% of students are a year behind (repeated or late enroll)."""
+    base = grade_base_start_idx[grade]
+    if status != "graduated" and random.random() < 0.15 and base > 0:
+        return base - 1  # started one year earlier (repeated a grade or enrolled late)
+    return base
+
+grade_start_year_index = grade_base_start_idx  # keep for compatibility
+
+student_ids        = []
+student_class_map  = {}
+student_enroll_idx = {}
+student_status_map = {}
+used_usernames     = set()
+user_rows          = []
+guardian_phones    = []   # (guardian_id, phone_number, label)
+teacher_phones     = []   # (teacher_id, phone_number, label)
+chunk              = 5000  # batch size for executemany
+
+def unique_uname(base):
+    base = base.lower().replace(" ","")
+    if base not in used_usernames:
+        used_usernames.add(base); return base
+    i = 2
+    while f"{base}{i}" in used_usernames: i += 1
+    used_usernames.add(f"{base}{i}"); return f"{base}{i}"
+
+for (class_id, grade, section) in classes:
+    n_students  = random.randint(18, 27)
+    start_y_idx = grade_start_year_index[grade]
+
+    for _ in range(n_students):
+        gender = random.choice(["Male","Female"])
+        f_name = random.choice(first_m if gender=="Male" else first_f)
+        l_name = random.choice(last_names)
+        age    = grade + 6 + random.randint(0, 1)
+        bdate  = date(2025 - age, random.randint(1,12), random.randint(1,28))
+        addr   = random.choice(addresses)
+
+        if grade == 12:
+            status = random.choices(["active","graduated","withdrawn"], weights=[65,25,10])[0]
+        else:
+            status = random.choices(["active","withdrawn"], weights=[96,4])[0]
+
+        g_gender = random.choice(["Male","Female"])
+        g_fname  = random.choice(first_m if g_gender=="Male" else first_f)
+        g_phone1 = f"0100-{random.randint(100,999)}-{random.randint(1000,9999)}"
+        g_phone2 = f"011{random.randint(0,9)}-{random.randint(100,999)}-{random.randint(1000,9999)}"
+        cur.execute("INSERT INTO Guardian (f_name,l_name,phone_no,gender) VALUES (%s,%s,%s,%s)",
+                    (g_fname, l_name, g_phone1, g_gender))
+        g_id = cur.lastrowid
+        # Second phone for guardian (normalised ContactPhone)
+        guardian_phones.append((g_id, g_phone1, "Primary"))
+        guardian_phones.append((g_id, g_phone2, "Mobile"))
+
+        actual_start_idx = get_start_year_idx(grade, status)
+        cur.execute("""INSERT INTO Student
+            (f_name,l_name,gender,birth_date,address,guardian_id,class_id,status,enrollment_year)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (f_name, l_name, gender, bdate, addr, g_id, class_id, status,
+                     int(year_labels[actual_start_idx][:4])))
+        s_id = cur.lastrowid
+        student_ids.append(s_id)
+        student_class_map[s_id]  = class_id
+        student_enroll_idx[s_id] = actual_start_idx
+        student_status_map[s_id] = status
+
+        pw    = genpw()
+        uname = unique_uname(f"{f_name}.{l_name}")
+        user_rows.append((uname, h(pw), pw, "student", s_id, None))
+
+for i, t_id in enumerate(teacher_ids):
+    td = teacher_data[i]
+    uname = unique_uname(f"{td[0]}.{td[1]}")
+    pw    = genpw()
+    user_rows.append((uname, h(pw), pw, "teacher", None, t_id))
+    # Two phone numbers per teacher
+    p1 = td[3]   # original phone from teacher_data
+    p2 = f"011{random.randint(0,9)}-{random.randint(100,999)}-{random.randint(1000,9999)}"
+    teacher_phones.append((t_id, p1, "Work"))
+    teacher_phones.append((t_id, p2, "Mobile"))
+
+admin_pw = "admin123"
+user_rows.append(("admin", h(admin_pw), admin_pw, "admin", None, None))
+
+cur.executemany("""INSERT INTO User
+    (user_name,password,plain_password,role,student_id,teacher_id)
+    VALUES (%s,%s,%s,%s,%s,%s)""", user_rows)
+
+# ── CONTACT PHONES (normalised) ──────────────────────────────────
+# conn.commit()
+# print("Contact phones...")
+# phone_rows = (
+#     [("guardian", eid, num, lbl) for (eid, num, lbl) in guardian_phones] +
+#     [("teacher",  eid, num, lbl) for (eid, num, lbl) in teacher_phones]
+# )
+# for i in range(0, len(phone_rows), chunk):
+#     cur.executemany("""INSERT IGNORE INTO ContactPhone
+#         (entity_type,entity_id,phone_number,label) VALUES (%s,%s,%s,%s)""",
+#         phone_rows[i:i+chunk])
+
+# ── ENROLLMENT ────────────────────────────────────────────────────
+print("Enrollments...")
+enroll_rows = []
+for s_id in student_ids:
+    c_id      = student_class_map[s_id]
+    grade     = next(c[1] for c in classes if c[0]==c_id)
+    start_idx = student_enroll_idx[s_id]
+    for y_id in year_ids[start_idx:]:
+        for sem_name in ["Fall","Spring"]:
+            sem_id = semesters[(y_id, sem_name)]
+            for subj_name in grade_subjects[grade]:
+                sub_id = subject_map.get((c_id, sem_id, subj_name))
+                if sub_id: enroll_rows.append((s_id, sub_id))
+
+for i in range(0, len(enroll_rows), chunk):
+    cur.executemany("INSERT IGNORE INTO Enrollment (student_id,subject_id) VALUES (%s,%s)",
+                    enroll_rows[i:i+chunk])
+
+conn.commit()
+# ── STUDENT PERFORMANCE PROFILES ─────────────────────────────────
+# Each student gets a realistic profile: base ability, trend, noise, subject biases.
+# Trends are distributed realistically: ~40% improving, ~35% stable, ~25% declining.
+print("Building student performance profiles...")
+student_profile = {}
+subject_biases  = {}   # per-student per-subject consistent bias
+
+for s_id in student_ids:
+    base  = random.uniform(35, 97)   # core ability across subjects
+
+    # Realistic trend distribution
+    r = random.random()
+    if r < 0.25:
+        trend = random.uniform(-3.5, -0.5)   # declining (~25%)
+    elif r < 0.60:
+        trend = random.uniform(-0.3, 0.3)    # stable (~35%)
+    else:
+        trend = random.uniform(0.5, 3.0)     # improving (~40%)
+
+    noise = random.uniform(3, 10)    # semester-to-semester variability
+    student_profile[s_id] = (base, trend, noise)
+
+    # Each student has fixed strong/weak subjects (consistent across semesters)
+    subject_biases[s_id] = {
+        subj: random.gauss(0, 8) for subj in [
+            "Mathematics","Science","English","Arabic","History",
+            "Geography","Computer Science","Art","Physical Education","Economics"
+        ]
+    }
+
+def student_mark(s_id, sem_idx, subj_name):
+    """Generate a realistic mark that stays consistent per student across semesters."""
+    base, trend, noise = student_profile[s_id]
+    # Core trajectory
+    adjusted = base + trend * sem_idx
+    # Semester noise (good days / bad days)
+    adjusted += random.uniform(-noise, noise)
+    # Consistent subject strength/weakness
+    bias = subject_biases[s_id].get(subj_name, 0)
+    mark = max(2, min(100, adjusted + bias))
+    return round(mark, 1)
+
+def component_from_total(total, max_q1, max_q2, max_mid, max_fn):
+    """Split a total mark into realistic component scores."""
+    # Proportional split with small noise per component
+    def noisy(prop, max_val):
+        v = total * prop + random.uniform(-max_val*0.08, max_val*0.08)
+        return round(max(0, min(max_val, v)), 1)
+    q1 = noisy(max_q1  / 100, max_q1)
+    q2 = noisy(max_q2  / 100, max_q2)
+    mt = noisy(max_mid / 100, max_mid)
+    fn = noisy(max_fn  / 100, max_fn)
+    return q1, q2, mt, fn
+
+# ── HISTORICAL GRADES (semesters 1-10) ──────────────────────────
+print("Historical grades (consistent per-student profiles)...")
+historical_grade_rows = []
+for s_id in student_ids:
+    c_id      = student_class_map[s_id]
+    grade     = next(c[1] for c in classes if c[0]==c_id)
+    start_idx = student_enroll_idx[s_id]
+    sem_idx   = 0
+    for y_id in year_ids[start_idx:-1]:
+        for sem_name in ["Fall","Spring"]:
+            sem_id = semesters[(y_id, sem_name)]
+            for subj_name in grade_subjects[grade]:
+                sub_id = subject_map.get((c_id, sem_id, subj_name))
+                if sub_id:
+                    if subj_name == "Physical Education":
+                        mark = round(random.uniform(60, 100), 1)
+                    else:
+                        mark = student_mark(s_id, sem_idx, subj_name)
+                    historical_grade_rows.append(
+                        (s_id, sub_id, sem_id, mark, letter_from_pct(mark)))
+            sem_idx += 1
+
+for i in range(0, len(historical_grade_rows), chunk):
+    cur.executemany("""INSERT IGNORE INTO Grades
+        (student_id,subject_id,semester_id,mark,status) VALUES (%s,%s,%s,%s,%s)""",
+        historical_grade_rows[i:i+chunk])
+
+# ── SEMESTER 11 (Fall 2025-2026): full GradeDetail ───────────────
+conn.commit()
+print("Semester 11 — detailed grades (complete, consistent profiles)...")
+detail11_rows = []; grades11_rows = []
+for s_id in student_ids:
+    c_id  = student_class_map[s_id]
+    grade = next(c[1] for c in classes if c[0]==c_id)
+    start_idx = student_enroll_idx[s_id]
+    if 5 < start_idx: continue
+    sem_idx = max(0, (5 - start_idx) * 2 + 1)   # approximate semester index
+    for subj_name in grade_subjects[grade]:
+        sub_id = subject_map.get((c_id, SEM_PREV, subj_name))
+        if not sub_id: continue
+        if subj_name == "Physical Education":
+            pe_pct = round(random.uniform(60, 100), 1)
+            grades11_rows.append((s_id, sub_id, SEM_PREV, pe_pct, letter_from_pct(pe_pct)))
+        else:
+            total = student_mark(s_id, sem_idx, subj_name)
+            q1, q2, mt, fn = component_from_total(total, MAX_QUIZ1, MAX_QUIZ2, MAX_MIDTERM, MAX_FINAL)
+            raw = round(q1+q2+mt+fn, 1)
+            detail11_rows.append((s_id, sub_id, SEM_PREV, q1, q2, mt, fn, raw))
+            grades11_rows.append((s_id, sub_id, SEM_PREV, raw, letter_from_pct(raw)))
+
+for i in range(0, len(grades11_rows), chunk):
+    cur.executemany("""INSERT IGNORE INTO Grades
+        (student_id,subject_id,semester_id,mark,status) VALUES (%s,%s,%s,%s,%s)""",
+        grades11_rows[i:i+chunk])
+for i in range(0, len(detail11_rows), chunk):
+    cur.executemany("""INSERT IGNORE INTO GradeDetail
+        (student_id,subject_id,semester_id,quiz1,quiz2,midterm,final_exam,total)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""", detail11_rows[i:i+chunk])
+
+# ── SEMESTER 12 (Spring 2025-2026): partial, final = NULL ────────
+conn.commit()
+print("Semester 12 — partial grades (final pending, consistent profiles)...")
+detail12_rows = []
+for s_id in student_ids:
+    c_id  = student_class_map[s_id]
+    grade = next(c[1] for c in classes if c[0]==c_id)
+    start_idx = student_enroll_idx[s_id]
+    if 5 < start_idx: continue
+    sem_idx = max(0, (5 - start_idx) * 2 + 2)
+    for subj_name in grade_subjects[grade]:
+        sub_id = subject_map.get((c_id, SEM_CURRENT, subj_name))
+        if not sub_id: continue
+        if subj_name == "Physical Education":
+            pe_pct = round(random.uniform(60, 100), 1)
+            cur.execute("""INSERT IGNORE INTO GradeDetail
+                (student_id,subject_id,semester_id,quiz1,quiz2,midterm,final_exam,total)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (s_id, sub_id, SEM_CURRENT, pe_pct, pe_pct, pe_pct, pe_pct, pe_pct))
+            cur.execute("""INSERT IGNORE INTO Grades (student_id,subject_id,semester_id,mark,status)
+                VALUES (%s,%s,%s,%s,%s)""",
+                (s_id, sub_id, SEM_CURRENT, pe_pct, letter_from_pct(pe_pct)))
+        else:
+            total_expected = student_mark(s_id, sem_idx, subj_name)
+            q1, q2, mt, _ = component_from_total(total_expected,
+                                                  MAX_QUIZ1, MAX_QUIZ2, MAX_MIDTERM, MAX_FINAL)
+            detail12_rows.append((s_id, sub_id, SEM_CURRENT, q1, q2, mt, None, None))
+
+for i in range(0, len(detail12_rows), chunk):
+    cur.executemany("""INSERT IGNORE INTO GradeDetail
+        (student_id,subject_id,semester_id,quiz1,quiz2,midterm,final_exam,total)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""", detail12_rows[i:i+chunk])
+
+# ── ATTENDANCE ────────────────────────────────────────────────────
+print("Attendance...")
+def school_days(start, count):
+    days, d = [], start
+    while len(days) < count:
+        if d.weekday() < 5: days.append(d)
+        d += timedelta(days=1)
+    return days
+
+year_starts = {
+    year_ids[0]: (date(2020,9,1),  date(2021,1,20)),
+    year_ids[1]: (date(2021,9,1),  date(2022,1,20)),
+    year_ids[2]: (date(2022,9,1),  date(2023,1,20)),
+    year_ids[3]: (date(2023,9,1),  date(2024,1,20)),
+    year_ids[4]: (date(2024,9,1),  date(2025,1,20)),
+    year_ids[5]: (date(2025,9,1),  date(2026,1,20)),
+}
+# Attendance correlated with student ability — weaker students miss more
+def make_att_pool(base_ability):
+    """Return a status pool biased by student ability (0-100)."""
+    # High ability → more present; Low ability → more absent
+    present_w = int(60 + base_ability * 0.3)   # 60-90 range
+    absent_w  = int(25 - base_ability * 0.15)  # 10-25 range
+    late_w    = random.randint(3, 8)
+    excused_w = random.randint(2, 6)
+    return (["Present"] * present_w +
+            ["Absent"]  * max(absent_w, 3) +
+            ["Late"]    * late_w +
+            ["Excused"] * excused_w)
+
+att_rows = []
+for s_id in student_ids:
+    base_ability = student_profile[s_id][0]   # use student's base grade ability
+    pool = make_att_pool(base_ability)
+    start_idx = student_enroll_idx[s_id]
+    for y_id in year_ids[start_idx:]:
+        fall_start, spring_start = year_starts[y_id]
+        if y_id == year_ids[5]:
+            fall_days   = school_days(fall_start,   55)
+            spring_days = school_days(spring_start, 40)
+        else:
+            fall_days   = school_days(fall_start,   55)
+            spring_days = school_days(spring_start, 55)
+        f_sem = semesters[(y_id,"Fall")]
+        s_sem = semesters[(y_id,"Spring")]
+        for day in fall_days:
+            att_rows.append((s_id, day, random.choice(pool), f_sem))
+        for day in spring_days:
+            att_rows.append((s_id, day, random.choice(pool), s_sem))
+
+for i in range(0, len(att_rows), chunk):
+    cur.executemany("""INSERT IGNORE INTO Attendance
+        (student_id,date,status,semester_id) VALUES (%s,%s,%s,%s)""",
+        att_rows[i:i+chunk])
+
+# ── GPA (years 2020-2024 only) ────────────────────────────────────
+conn.commit()
+print("GPA...")
+gpa_rows = []
+for y_id in year_ids[:-1]:
+    avgs = []
+    for s_id in student_ids:
+        start_idx = student_enroll_idx[s_id]
+        if year_ids.index(y_id) < start_idx: continue
+        c_id  = student_class_map[s_id]
+        grade = next(c[1] for c in classes if c[0]==c_id)
+        marks = []
+        for sem_name in ["Fall","Spring"]:
+            sem_id = semesters[(y_id, sem_name)]
+            for subj_name in grade_subjects[grade]:
+                if subj_name == "Physical Education": continue
+                sub_id = subject_map.get((c_id, sem_id, subj_name))
+                if sub_id:
+                    row = next((r for r in historical_grade_rows
+                                if r[0]==s_id and r[1]==sub_id and r[2]==sem_id), None)
+                    if row: marks.append(float(row[3]))
+        if marks:
+            gpa = round((sum(marks)/len(marks))/25, 2)
+            avgs.append((s_id, gpa))
+    by_class = defaultdict(list)
+    for s_id, gpa in avgs:
+        by_class[student_class_map[s_id]].append((s_id, gpa))
+    for c_id, lst in by_class.items():
+        lst.sort(key=lambda x: x[1], reverse=True)
+        for rank, (s_id, gpa) in enumerate(lst, 1):
+            gpa_rows.append((s_id, y_id, gpa, rank))
+
+cur.executemany("""INSERT IGNORE INTO GPA
+    (student_id,school_year_id,value,student_rank) VALUES (%s,%s,%s,%s)""", gpa_rows)
+
+# ── ANNOUNCEMENTS ────────────────────────────────────────────────
+print("Announcements...")
+cur.execute("SELECT user_id FROM User WHERE role='admin' LIMIT 1")
+row = cur.fetchone(); admin_uid = row[0] if row else 1
+
+sample_anns = [
+    (admin_uid, "Welcome — Spring Semester 2025-2026",
+     "Welcome back. Final exams are scheduled for June 2026. "
+     "Quiz and midterm grades are now visible on your report card.",
+     "all", None),
+    (admin_uid, "Final Exam Schedule — June 1-15",
+     "Final exams begin June 1, 2026. Each subject requires a minimum of "
+     f"{PASS_RAW}/{MAX_TOTAL} (60%) to pass. Results published within 48 hours of each exam.",
+     "students", None),
+    (admin_uid, "Grade Entry Deadline — May 30",
+     f"All final exam marks must be entered by May 30. "
+     f"Reminder: Quiz 1 max {MAX_QUIZ1}, Quiz 2 max {MAX_QUIZ2}, "
+     f"Midterm max {MAX_MIDTERM}, Final max {MAX_FINAL}.",
+     "teachers", None),
+    (admin_uid, "End-of-Year Processing",
+     "After all finals are entered, admin will run end-of-year processing. "
+     "Grade 12 students who pass ALL subjects will be marked as Graduated. "
+     "Students who fail any subject will repeat the academic year.",
+     "all", None),
+]
+for ann in sample_anns:
+    cur.execute("""INSERT INTO Announcement (sender_id,title,body,target_type,target_id)
+                   VALUES (%s,%s,%s,%s,%s)""", ann)
+
+cur.close()
+conn.close()
+
+active  = sum(1 for s in student_status_map.values() if s=="active")
+grad    = sum(1 for s in student_status_map.values() if s=="graduated")
+withdr  = sum(1 for s in student_status_map.values() if s=="withdrawn")
+
+print("\n✅ Seed complete!")
+print(f"   Years     : 6  (2020-2021 → 2025-2026)")
+print(f"   Semesters : 12  (active = semester 12, Spring 2025-2026)")
+print(f"   Teachers  : 20")
+print(f"   Classes   : 12 (Grades 7-12, A & B)")
+print(f"   Students  : {len(student_ids)}  ({active} active, {grad} graduated, {withdr} withdrawn)")
+print(f"   Grade weights: Q1/{MAX_QUIZ1} + Q2/{MAX_QUIZ2} + Mid/{MAX_MIDTERM} + Final/{MAX_FINAL} = {MAX_TOTAL} raw")
+print()
+print("   Admin login → admin / admin123")
+print("   All other credentials → check User Accounts page in the app")

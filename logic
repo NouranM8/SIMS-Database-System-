@@ -1,0 +1,2118 @@
+"""
+logic.py — SIMS complete database logic
+Grade weights: quiz1(10) + quiz2(10) + midterm(20) + final(60) = 100 total
+Pass threshold: 60 / 100 PER SUBJECT (not average)
+Active semester: always the latest one in the DB
+Promotion: per-subject pass/fail, missing finals block processing
+"""
+
+import hashlib, random, string
+import mysql.connector
+
+# ═══════════════════════════════════════════════════════════════════
+#  CONNECTION
+# ═══════════════════════════════════════════════════════════════════
+
+def get_connection():
+    return mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="sondos",   # ← change this
+        database="sims",
+        autocommit=True       # ensures every write is immediately visible to reads
+    )
+
+def _q(conn, sql, params=(), one=False):
+    cur = conn.cursor(dictionary=True)
+    cur.execute(sql, params)
+    result = cur.fetchone() if one else cur.fetchall()
+    cur.close()
+    return result
+
+def _run(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    last_id = cur.lastrowid
+    cur.close()
+    return last_id
+
+def _hash(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def generate_password():
+    c = random.choices(string.ascii_lowercase, k=4) + random.choices(string.digits, k=4)
+    random.shuffle(c)
+    return "".join(c)
+
+# ═══════════════════════════════════════════════════════════════════
+#  GRADE WEIGHTS & RULES
+#  quiz1=10, quiz2=10, midterm=20, final=60 → max raw = 100
+#  Pass mark = 60/100 (60%)
+# ═══════════════════════════════════════════════════════════════════
+
+MAX_QUIZ1    = 10
+MAX_QUIZ2    = 10
+MAX_MIDTERM  = 20
+MAX_FINAL    = 60
+MAX_TOTAL    = MAX_QUIZ1 + MAX_QUIZ2 + MAX_MIDTERM + MAX_FINAL   # 100
+PASS_RAW     = int(MAX_TOTAL * 0.60)   # 60 out of 100 = 60%
+PASS_MARK    = 60   # percentage equivalent stored in Grades.mark
+
+def _validate_component(value, max_val, name):
+    if value is None:
+        return None
+    v = float(value)
+    if v < 0 or v > max_val:
+        raise ValueError(f"{name} must be between 0 and {max_val}. Got {v}.")
+    return round(v, 1)
+
+def _compute_total(quiz1, quiz2, midterm, final_exam):
+    if final_exam is None:
+        return None
+    q1 = quiz1 or 0
+    q2 = quiz2 or 0
+    mt = midterm or 0
+    return round(q1 + q2 + mt + float(final_exam), 1)
+
+def _raw_to_pct(raw):
+    if raw is None:
+        return None
+    return round(raw, 1)
+
+def _letter(pct):
+    if pct is None: return "—"
+    if pct >= 90: return "A"
+    if pct >= 80: return "B"
+    if pct >= 70: return "C"
+    if pct >= 60: return "D"
+    return "F"
+
+# ═══════════════════════════════════════════════════════════════════
+#  AUTH
+# ═══════════════════════════════════════════════════════════════════
+
+def login(conn, username, password):
+    return _q(conn, """
+        SELECT user_id, user_name, role, student_id, teacher_id
+        FROM User WHERE user_name=%s AND password=%s
+    """, (username, _hash(password)), one=True)
+
+def change_password(conn, user_id, old_pw, new_pw):
+    u = _q(conn, "SELECT password FROM User WHERE user_id=%s", (user_id,), one=True)
+    if not u or u["password"] != _hash(old_pw):
+        return False, "Current password is incorrect."
+    _run(conn, "UPDATE User SET password=%s, plain_password=%s WHERE user_id=%s",
+         (_hash(new_pw), new_pw, user_id))
+    return True, "Password changed."
+
+# ═══════════════════════════════════════════════════════════════════
+#  ACADEMIC YEAR & SEMESTER
+# ═══════════════════════════════════════════════════════════════════
+
+def get_academic_years(conn):
+    return _q(conn, "SELECT * FROM AcademicYear ORDER BY school_year_id DESC")
+
+def get_semesters(conn, year_id=None):
+    if year_id:
+        return _q(conn,
+            "SELECT * FROM Semester WHERE school_year_id=%s ORDER BY semester_id",
+            (year_id,))
+    return _q(conn, "SELECT * FROM Semester ORDER BY semester_id")
+
+def get_semesters_with_year(conn):
+    """Returns all semesters joined with AcademicYear for human-readable labels."""
+    return _q(conn, """
+        SELECT s.semester_id, s.name, s.school_year_id, a.year_name,
+               CONCAT(s.name, ' ', a.year_name) AS full_label
+        FROM Semester s
+        JOIN AcademicYear a ON s.school_year_id = a.school_year_id
+        ORDER BY s.semester_id
+    """)
+
+def get_active_semester(conn):
+    """Always the latest semester in the database."""
+    return _q(conn, """
+        SELECT s.*, a.year_name
+        FROM Semester s
+        JOIN AcademicYear a ON s.school_year_id = a.school_year_id
+        ORDER BY s.semester_id DESC LIMIT 1
+    """, one=True)
+
+def add_academic_year(conn, year_label):
+    if _q(conn, "SELECT school_year_id FROM AcademicYear WHERE year_name=%s",
+          (year_label,), one=True):
+        return None, None, f"Year '{year_label}' already exists."
+    yid = _run(conn, "INSERT INTO AcademicYear (year_name) VALUES (%s)", (year_label,))
+    fid = _run(conn, "INSERT INTO Semester (name,school_year_id) VALUES ('Fall',%s)", (yid,))
+    return yid, fid, f"Year {year_label} created with Fall semester."
+
+def add_spring_semester(conn, year_id):
+    if _q(conn, "SELECT semester_id FROM Semester WHERE school_year_id=%s AND name='Spring'",
+          (year_id,), one=True):
+        return None, "Spring semester already exists for this year."
+    sid = _run(conn, "INSERT INTO Semester (name,school_year_id) VALUES ('Spring',%s)", (year_id,))
+    return sid, "Spring semester added."
+
+# ═══════════════════════════════════════════════════════════════════
+#  DASHBOARD STATS
+# ═══════════════════════════════════════════════════════════════════
+
+def get_dashboard_stats(conn):
+    sem = get_active_semester(conn)
+    sem_id = sem["semester_id"] if sem else 0
+
+    stats = {
+        "active_semester":  sem,
+        "total_students":   _q(conn, "SELECT COUNT(*) AS n FROM Student WHERE status='active'", one=True)["n"],
+        "total_teachers":   _q(conn, "SELECT COUNT(*) AS n FROM Teacher", one=True)["n"],
+        "total_classes":    _q(conn, "SELECT COUNT(*) AS n FROM Class", one=True)["n"],
+        "graduated":        _q(conn, "SELECT COUNT(*) AS n FROM Student WHERE status='graduated'", one=True)["n"],
+        "withdrawn":        _q(conn, "SELECT COUNT(*) AS n FROM Student WHERE status='withdrawn'", one=True)["n"],
+        "attendance_today": _q(conn, "SELECT status,COUNT(*) AS n FROM Attendance WHERE date=CURDATE() GROUP BY status"),
+        "finals_pending":   _q(conn, """
+            SELECT COUNT(DISTINCT gd.student_id) AS n FROM GradeDetail gd
+            WHERE gd.semester_id=%s AND gd.final_exam IS NULL
+        """, (sem_id,), one=True)["n"],
+    }
+
+    stats["failing_students"] = _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name,
+               sub.name AS subject,
+               COALESCE(gd.total, g.mark) AS raw_mark
+        FROM Student s
+        JOIN Grades g   ON g.student_id = s.student_id AND g.semester_id=%s
+        JOIN Subject sub ON g.subject_id = sub.subject_id
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id
+                                AND gd.subject_id=g.subject_id
+                                AND gd.semester_id=g.semester_id
+        WHERE s.status='active'
+          AND g.mark < 60
+          AND sub.name != 'Physical Education'
+        ORDER BY g.mark ASC LIMIT 20
+    """, (sem_id,))
+
+    return stats
+
+# ═══════════════════════════════════════════════════════════════════
+#  STUDENTS
+# ═══════════════════════════════════════════════════════════════════
+
+def get_recent_grade_activity(conn, limit=20):
+    """Most recently updated GradeDetail rows for the active semester."""
+    return _q(conn, """
+        SELECT s.f_name, s.l_name, c.grade, c.section,
+               sub.name AS subject,
+               gd.quiz1, gd.quiz2, gd.midterm, gd.final_exam
+        FROM GradeDetail gd
+        JOIN Student s  ON gd.student_id=s.student_id
+        JOIN Subject sub ON gd.subject_id=sub.subject_id
+        JOIN Class c    ON s.class_id=c.class_id
+        WHERE gd.semester_id=(
+            SELECT semester_id FROM Semester ORDER BY semester_id DESC LIMIT 1)
+        ORDER BY gd.detail_id DESC
+        LIMIT %s
+    """, (limit,))
+
+def get_all_students(conn, status="active"):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, s.gender, s.birth_date,
+               s.status, s.enrollment_year,
+               c.grade, c.section,
+               g.f_name AS guardian_fname, g.l_name AS guardian_lname, g.phone_no
+        FROM Student s
+        JOIN Class    c ON s.class_id    = c.class_id
+        JOIN Guardian g ON s.guardian_id = g.guardian_id
+        WHERE s.status=%s ORDER BY c.grade, c.section, s.l_name
+    """, (status,))
+
+def get_past_students(conn):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, s.gender, s.status, s.enrollment_year,
+               c.grade AS last_grade, c.section AS last_section,
+               g.f_name AS guardian_fname, g.l_name AS guardian_lname, g.phone_no,
+               (SELECT gpa.value FROM GPA gpa WHERE gpa.student_id=s.student_id
+                ORDER BY gpa.school_year_id DESC LIMIT 1) AS final_gpa
+        FROM Student s
+        JOIN Class    c ON s.class_id    = c.class_id
+        JOIN Guardian g ON s.guardian_id = g.guardian_id
+        WHERE s.status IN ('graduated','withdrawn')
+        ORDER BY s.status, s.l_name
+    """)
+
+def get_student_by_id(conn, student_id):
+    return _q(conn, """
+        SELECT s.*, c.grade, c.section,
+               g.f_name AS g_fname, g.l_name AS g_lname,
+               g.phone_no AS g_phone, g.gender AS g_gender
+        FROM Student s
+        JOIN Class    c ON s.class_id    = c.class_id
+        JOIN Guardian g ON s.guardian_id = g.guardian_id
+        WHERE s.student_id=%s
+    """, (student_id,), one=True)
+
+def search_students(conn, keyword, status="active"):
+    kw = f"%{keyword}%"
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, s.gender, s.birth_date,
+               s.status, c.grade, c.section
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status=%s
+          AND (s.f_name LIKE %s OR s.l_name LIKE %s
+               OR s.student_id LIKE %s OR CONCAT(c.grade,' ',c.section) LIKE %s)
+        ORDER BY s.l_name
+    """, (status, kw, kw, kw, kw))
+
+def get_students_by_class(conn, class_id):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, s.gender, s.birth_date
+        FROM Student s WHERE s.class_id=%s AND s.status='active'
+        ORDER BY s.l_name
+    """, (class_id,))
+
+def add_student(conn, f_name, l_name, gender, birth_date, address,
+                guardian_id, class_id, enrollment_year=None):
+    import datetime
+    ey = enrollment_year or datetime.date.today().year
+    return _run(conn, """
+        INSERT INTO Student (f_name,l_name,gender,birth_date,address,guardian_id,
+                             class_id,status,enrollment_year)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,'active',%s)
+    """, (f_name, l_name, gender, birth_date, address, guardian_id, class_id, ey))
+
+def update_student(conn, student_id, f_name, l_name, gender, birth_date, address, class_id):
+    _run(conn, """
+        UPDATE Student SET f_name=%s,l_name=%s,gender=%s,
+               birth_date=%s,address=%s,class_id=%s WHERE student_id=%s
+    """, (f_name, l_name, gender, birth_date, address, class_id, student_id))
+
+def update_student_status(conn, student_id, status):
+    _run(conn, "UPDATE Student SET status=%s WHERE student_id=%s", (status, student_id))
+
+def withdraw_student(conn, student_id):
+    _run(conn, "UPDATE Student SET status='withdrawn' WHERE student_id=%s", (student_id,))
+
+def delete_student(conn, student_id):
+    _run(conn, "DELETE FROM Student WHERE student_id=%s", (student_id,))
+
+# ═══════════════════════════════════════════════════════════════════
+#  GUARDIANS
+# ═══════════════════════════════════════════════════════════════════
+
+def add_guardian(conn, f_name, l_name, phone_no, gender):
+    return _run(conn, "INSERT INTO Guardian (f_name,l_name,phone_no,gender) VALUES (%s,%s,%s,%s)",
+                (f_name, l_name, phone_no, gender))
+
+def get_guardian_by_student(conn, student_id):
+    return _q(conn, """
+        SELECT g.* FROM Guardian g JOIN Student s ON s.guardian_id=g.guardian_id
+        WHERE s.student_id=%s
+    """, (student_id,), one=True)
+
+# ═══════════════════════════════════════════════════════════════════
+#  TEACHERS
+# ═══════════════════════════════════════════════════════════════════
+
+def get_all_teachers(conn):
+    return _q(conn, "SELECT * FROM Teacher ORDER BY l_name")
+
+def get_teacher_by_id(conn, teacher_id):
+    return _q(conn, "SELECT * FROM Teacher WHERE teacher_id=%s", (teacher_id,), one=True)
+
+def get_teacher_classes(conn, teacher_id):
+    sem = get_active_semester(conn)
+    if not sem: return []
+    return _q(conn, """
+        SELECT DISTINCT c.class_id, c.grade, c.section
+        FROM Subject sub
+        JOIN Enrollment e ON e.subject_id=sub.subject_id
+        JOIN Student    s ON e.student_id=s.student_id
+        JOIN Class      c ON s.class_id=c.class_id
+        WHERE sub.teacher_id=%s AND sub.semester_id=%s
+        UNION
+        SELECT DISTINCT c2.class_id, c2.grade, c2.section
+        FROM Class c2 WHERE c2.homeroom_teacher_id=%s
+        ORDER BY grade, section
+    """, (teacher_id, sem["semester_id"], teacher_id))
+
+def add_teacher(conn, f_name, l_name, email, phone_no, gender, birth_date):
+    return _run(conn, """
+        INSERT INTO Teacher (f_name,l_name,email,phone_no,gender,birth_date)
+        VALUES (%s,%s,%s,%s,%s,%s)
+    """, (f_name, l_name, email, phone_no, gender, birth_date))
+
+def update_teacher(conn, teacher_id, f_name, l_name, email, phone_no, gender, birth_date):
+    _run(conn, """
+        UPDATE Teacher SET f_name=%s,l_name=%s,email=%s,phone_no=%s,gender=%s,birth_date=%s
+        WHERE teacher_id=%s
+    """, (f_name, l_name, email, phone_no, gender, birth_date, teacher_id))
+
+def delete_teacher(conn, teacher_id):
+    _run(conn, "DELETE FROM Teacher WHERE teacher_id=%s", (teacher_id,))
+
+# ═══════════════════════════════════════════════════════════════════
+#  CLASSES
+# ═══════════════════════════════════════════════════════════════════
+
+def get_all_classes(conn):
+    return _q(conn, """
+        SELECT c.class_id, c.grade, c.section,
+               t.f_name, t.l_name,
+               COUNT(s.student_id) AS student_count
+        FROM Class c
+        LEFT JOIN Teacher t ON c.homeroom_teacher_id=t.teacher_id
+        LEFT JOIN Student s ON s.class_id=c.class_id AND s.status='active'
+        GROUP BY c.class_id, c.grade, c.section, t.f_name, t.l_name
+        ORDER BY c.grade, c.section
+    """)
+
+def get_class_by_id(conn, class_id):
+    return _q(conn, """
+        SELECT c.*, t.f_name, t.l_name FROM Class c
+        LEFT JOIN Teacher t ON c.homeroom_teacher_id=t.teacher_id
+        WHERE c.class_id=%s
+    """, (class_id,), one=True)
+
+def add_class(conn, grade, section, homeroom_teacher_id):
+    return _run(conn, "INSERT INTO Class (grade,section,homeroom_teacher_id) VALUES (%s,%s,%s)",
+                (grade, section, homeroom_teacher_id))
+
+def update_class(conn, class_id, grade, section, homeroom_teacher_id):
+    _run(conn, "UPDATE Class SET grade=%s,section=%s,homeroom_teacher_id=%s WHERE class_id=%s",
+         (grade, section, homeroom_teacher_id, class_id))
+
+# ═══════════════════════════════════════════════════════════════════
+#  SUBJECTS
+# ═══════════════════════════════════════════════════════════════════
+
+def get_subjects_by_class_semester(conn, class_id, semester_id):
+    return _q(conn, """
+        SELECT sub.subject_id, sub.name, t.f_name, t.l_name, sem.name AS semester_name
+        FROM Subject sub
+        JOIN Teacher  t   ON sub.teacher_id  = t.teacher_id
+        JOIN Semester sem ON sub.semester_id = sem.semester_id
+        JOIN Enrollment e ON e.subject_id    = sub.subject_id
+        JOIN Student    s ON e.student_id    = s.student_id
+        WHERE s.class_id=%s AND sub.semester_id=%s
+        GROUP BY sub.subject_id, sub.name, t.f_name, t.l_name, sem.name
+        ORDER BY sub.name
+    """, (class_id, semester_id))
+
+def get_teacher_subjects(conn, teacher_id, semester_id):
+    return _q(conn, """
+        SELECT sub.subject_id, sub.name,
+               c.class_id, c.grade, c.section,
+               COUNT(DISTINCT e.student_id) AS enrolled_count
+        FROM Subject sub
+        JOIN Enrollment e ON e.subject_id=sub.subject_id
+        JOIN Student    s ON e.student_id=s.student_id
+        JOIN Class      c ON s.class_id=c.class_id
+        WHERE sub.teacher_id=%s AND sub.semester_id=%s
+        GROUP BY sub.subject_id, c.class_id, sub.name, c.grade, c.section
+        ORDER BY c.grade, c.section, sub.name
+    """, (teacher_id, semester_id))
+
+def add_subject(conn, name, teacher_id, semester_id):
+    return _run(conn, "INSERT INTO Subject (name,teacher_id,semester_id) VALUES (%s,%s,%s)",
+                (name, teacher_id, semester_id))
+
+def update_subject(conn, subject_id, name, teacher_id):
+    _run(conn, "UPDATE Subject SET name=%s,teacher_id=%s WHERE subject_id=%s",
+         (name, teacher_id, subject_id))
+
+def delete_subject(conn, subject_id):
+    _run(conn, "DELETE FROM Subject WHERE subject_id=%s", (subject_id,))
+
+# ═══════════════════════════════════════════════════════════════════
+#  ENROLLMENT
+# ═══════════════════════════════════════════════════════════════════
+
+def get_student_enrollments(conn, student_id, semester_id):
+    return _q(conn, """
+        SELECT sub.subject_id, sub.name, t.f_name, t.l_name
+        FROM Enrollment e
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        JOIN Teacher  t  ON sub.teacher_id=t.teacher_id
+        WHERE e.student_id=%s AND sub.semester_id=%s ORDER BY sub.name
+    """, (student_id, semester_id))
+
+def enroll_student(conn, student_id, subject_id):
+    if _q(conn, "SELECT enrollment_id FROM Enrollment WHERE student_id=%s AND subject_id=%s",
+          (student_id, subject_id), one=True):
+        return None, "Already enrolled."
+    eid = _run(conn, "INSERT INTO Enrollment (student_id,subject_id) VALUES (%s,%s)",
+               (student_id, subject_id))
+    return eid, "Enrolled."
+
+def drop_enrollment(conn, student_id, subject_id):
+    _run(conn, "DELETE FROM Enrollment WHERE student_id=%s AND subject_id=%s",
+         (student_id, subject_id))
+
+# ═══════════════════════════════════════════════════════════════════
+#  GRADE COMPONENTS
+# ═══════════════════════════════════════════════════════════════════
+
+def save_grade_detail(conn, student_id, subject_id, semester_id,
+                      quiz1=None, quiz2=None, midterm=None, final_exam=None):
+    try:
+        q1 = _validate_component(quiz1,      MAX_QUIZ1,   "Quiz 1")
+        q2 = _validate_component(quiz2,      MAX_QUIZ2,   "Quiz 2")
+        mt = _validate_component(midterm,    MAX_MIDTERM, "Midterm")
+        fn = _validate_component(final_exam, MAX_FINAL,   "Final exam")
+    except ValueError as e:
+        return None, None, str(e)
+
+    total_raw = _compute_total(q1, q2, mt, fn)
+    pct       = _raw_to_pct(total_raw)
+
+    if _q(conn, """SELECT detail_id FROM GradeDetail
+                   WHERE student_id=%s AND subject_id=%s AND semester_id=%s""",
+          (student_id, subject_id, semester_id), one=True):
+        _run(conn, """
+            UPDATE GradeDetail SET quiz1=%s,quiz2=%s,midterm=%s,final_exam=%s,total=%s
+            WHERE student_id=%s AND subject_id=%s AND semester_id=%s
+        """, (q1, q2, mt, fn, total_raw, student_id, subject_id, semester_id))
+    else:
+        _run(conn, """
+            INSERT INTO GradeDetail
+                (student_id,subject_id,semester_id,quiz1,quiz2,midterm,final_exam,total)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (student_id, subject_id, semester_id, q1, q2, mt, fn, total_raw))
+
+    if pct is not None:
+        _save_grade_pct(conn, student_id, subject_id, semester_id, pct)
+
+    return total_raw, pct, None
+
+def _save_grade_pct(conn, student_id, subject_id, semester_id, pct):
+    status = _letter(pct)
+    if _q(conn, """SELECT grade_id FROM Grades
+                   WHERE student_id=%s AND subject_id=%s AND semester_id=%s""",
+          (student_id, subject_id, semester_id), one=True):
+        _run(conn, """UPDATE Grades SET mark=%s,status=%s
+                      WHERE student_id=%s AND subject_id=%s AND semester_id=%s""",
+             (pct, status, student_id, subject_id, semester_id))
+    else:
+        _run(conn, """INSERT INTO Grades (student_id,subject_id,semester_id,mark,status)
+                      VALUES (%s,%s,%s,%s,%s)""",
+             (student_id, subject_id, semester_id, pct, status))
+
+def save_grade(conn, student_id, subject_id, semester_id, mark):
+    if float(mark) < 0 or float(mark) > 100:
+        raise ValueError("Mark must be between 0 and 100.")
+    _save_grade_pct(conn, student_id, subject_id, semester_id, float(mark))
+
+def get_grade_detail(conn, student_id, subject_id, semester_id):
+    return _q(conn, """SELECT * FROM GradeDetail
+                       WHERE student_id=%s AND subject_id=%s AND semester_id=%s""",
+              (student_id, subject_id, semester_id), one=True)
+
+def get_class_grade_details(conn, class_id, subject_id, semester_id):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name,
+               gd.quiz1, gd.quiz2, gd.midterm,
+               gd.final_exam, gd.total,
+               CASE WHEN gd.detail_id IS NULL THEN 1
+                    WHEN gd.final_exam IS NULL THEN 1
+                    ELSE 0 END AS final_pending
+        FROM Student s
+        LEFT JOIN GradeDetail gd ON gd.student_id =s.student_id
+                                AND gd.subject_id =%s
+                                AND gd.semester_id=%s
+        WHERE s.class_id=%s AND s.status='active'
+        ORDER BY s.l_name
+    """, (subject_id, semester_id, class_id))
+
+def get_grades_by_student(conn, student_id):
+    """Historical grades from Grades table (completed semesters only)."""
+    return _q(conn, """
+        SELECT g.grade_id, sub.name AS subject, g.mark AS pct, g.status,
+               sem.name AS semester, a.year_name, a.school_year_id,
+               CASE WHEN sub.name='Physical Education' THEN 1 ELSE 0 END AS is_pe,
+               gd.quiz1, gd.quiz2, gd.midterm, gd.final_exam, gd.total AS raw_total
+        FROM Grades g
+        JOIN Subject      sub ON g.subject_id      = sub.subject_id
+        JOIN Semester     sem ON g.semester_id      = sem.semester_id
+        JOIN AcademicYear a   ON sem.school_year_id = a.school_year_id
+        LEFT JOIN GradeDetail gd ON gd.student_id =g.student_id
+                                AND gd.subject_id =g.subject_id
+                                AND gd.semester_id=g.semester_id
+        WHERE g.student_id=%s
+        ORDER BY a.school_year_id, sem.semester_id, sub.name
+    """, (student_id,))
+
+def get_full_grade_history(conn, student_id):
+    """
+    Returns ALL semesters including those where finals are pending (no Grades row yet).
+    Uses GradeDetail as master — shows quiz/mid even when final not yet entered.
+    Only returns rows where at least some data exists (GradeDetail or Grades row).
+    result_status = 'Pending' when final_exam IS NULL, 'Pass'/'Fail' when complete.
+    """
+    return _q(conn, """
+        SELECT
+            a.year_name,
+            sem.name          AS semester_name,
+            sem.semester_id,
+            sub.name          AS subject,
+            sub.subject_id,
+            CASE WHEN sub.name='Physical Education' THEN 1 ELSE 0 END AS is_pe,
+            gd.quiz1,
+            gd.quiz2,
+            gd.midterm,
+            gd.final_exam,
+            gd.total          AS raw_total,
+            g.mark            AS pct,
+            CASE
+                WHEN gd.detail_id IS NOT NULL AND gd.final_exam IS NULL THEN 'Pending'
+                WHEN g.mark IS NULL                                     THEN '—'
+                WHEN g.mark >= 60                                       THEN 'Pass'
+                ELSE 'Fail'
+            END               AS result_status,
+            CASE WHEN gd.detail_id IS NOT NULL THEN 1 ELSE 0 END AS has_detail
+        FROM Enrollment e
+        JOIN Subject      sub ON sub.subject_id    = e.subject_id
+        JOIN Semester     sem ON sub.semester_id   = sem.semester_id
+        JOIN AcademicYear a   ON sem.school_year_id = a.school_year_id
+        LEFT JOIN GradeDetail gd ON gd.student_id  = e.student_id
+                                AND gd.subject_id  = sub.subject_id
+                                AND gd.semester_id = sem.semester_id
+        LEFT JOIN Grades g       ON g.student_id   = e.student_id
+                                AND g.subject_id   = sub.subject_id
+                                AND g.semester_id  = sem.semester_id
+        WHERE e.student_id = %s
+          AND (gd.detail_id IS NOT NULL OR g.grade_id IS NOT NULL)
+        ORDER BY a.school_year_id, sem.semester_id, is_pe, sub.name
+    """, (student_id,))
+
+def get_grades_by_class_subject(conn, class_id, subject_id, semester_id):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, g.grade_id, g.mark, g.status
+        FROM Student s
+        LEFT JOIN Grades g ON g.student_id=s.student_id
+                          AND g.subject_id=%s AND g.semester_id=%s
+        WHERE s.class_id=%s AND s.status='active'
+        ORDER BY s.l_name
+    """, (subject_id, semester_id, class_id))
+
+def get_class_ranking(conn, class_id, semester_id):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name,
+               ROUND(AVG(g.mark),2) AS avg_mark
+        FROM Student s
+        JOIN Grades  g   ON g.student_id=s.student_id
+        JOIN Subject sub ON g.subject_id=sub.subject_id
+        WHERE s.class_id=%s AND g.semester_id=%s
+          AND sub.name!='Physical Education' AND s.status='active'
+        GROUP BY s.student_id, s.f_name, s.l_name
+        ORDER BY avg_mark DESC
+    """, (class_id, semester_id))
+
+# ═══════════════════════════════════════════════════════════════════
+#  REPORT CARD
+# ═══════════════════════════════════════════════════════════════════
+
+def get_report_card(conn, student_id, semester_id):
+    student  = get_student_by_id(conn, student_id)
+    semester = _q(conn, """
+        SELECT sem.*, a.year_name, a.school_year_id
+        FROM Semester sem JOIN AcademicYear a ON sem.school_year_id=a.school_year_id
+        WHERE sem.semester_id=%s
+    """, (semester_id,), one=True)
+
+    rows = _q(conn, """
+        SELECT sub.name AS subject, sub.subject_id,
+               CONCAT(t.f_name,' ',t.l_name) AS teacher,
+               g.mark AS pct, g.status AS letter_grade,
+               gd.quiz1, gd.quiz2, gd.midterm, gd.final_exam, gd.total AS raw_total,
+               CASE WHEN sub.name='Physical Education' THEN 1 ELSE 0 END AS is_pe,
+               CASE WHEN gd.detail_id IS NOT NULL AND gd.final_exam IS NULL
+                    THEN 1 ELSE 0 END AS final_pending
+        FROM Subject sub
+        JOIN Teacher t ON sub.teacher_id=t.teacher_id
+        JOIN Enrollment e ON e.subject_id=sub.subject_id AND e.student_id=%s
+        LEFT JOIN Grades g ON g.student_id=%s AND g.subject_id=sub.subject_id
+                          AND g.semester_id=%s
+        LEFT JOIN GradeDetail gd ON gd.student_id=%s AND gd.subject_id=sub.subject_id
+                                AND gd.semester_id=%s
+        WHERE sub.semester_id=%s
+        ORDER BY is_pe, sub.name
+    """, (student_id, student_id, semester_id, student_id, semester_id, semester_id))
+
+    has_detail = any(r["quiz1"] is not None or r["midterm"] is not None
+                     or r["final_exam"] is not None for r in rows)
+
+    academic = [r for r in rows if not r["is_pe"] and r["pct"] is not None]
+    avg_pct  = round(sum(float(r["pct"]) for r in academic) / len(academic), 1) if academic else None
+
+    year_id = semester["school_year_id"] if semester else None
+    gpa = _q(conn, "SELECT value,student_rank FROM GPA WHERE student_id=%s AND school_year_id=%s",
+             (student_id, year_id), one=True) if year_id else None
+
+    attendance = get_attendance_summary(conn, student_id, semester_id)
+
+    return {
+        "student":        student,
+        "semester":       semester,
+        "grades":         rows,
+        "average":        avg_pct,
+        "average_letter": _letter(avg_pct),
+        "attendance":     attendance,
+        "gpa":            gpa,
+        "has_detail":     has_detail,
+        "finals_pending": any(r.get("final_pending") for r in rows),
+        "max_components": {"quiz1": MAX_QUIZ1, "quiz2": MAX_QUIZ2,
+                           "midterm": MAX_MIDTERM, "final": MAX_FINAL, "total": MAX_TOTAL},
+    }
+
+def get_all_gpas_for_student(conn, student_id):
+    return _q(conn, """
+        SELECT a.year_name, a.school_year_id, gpa.value, gpa.student_rank
+        FROM GPA gpa JOIN AcademicYear a ON gpa.school_year_id=a.school_year_id
+        WHERE gpa.student_id=%s ORDER BY a.school_year_id
+    """, (student_id,))
+
+# ═══════════════════════════════════════════════════════════════════
+#  GPA
+# ═══════════════════════════════════════════════════════════════════
+
+def calculate_and_save_gpa(conn, student_id, year_id):
+    rows = _q(conn, """
+        SELECT g.mark
+        FROM Grades g
+        JOIN Subject  sub ON g.subject_id =sub.subject_id
+        JOIN Semester sem ON g.semester_id=sem.semester_id
+        WHERE g.student_id=%s AND sem.school_year_id=%s
+          AND sub.name!='Physical Education' AND g.mark IS NOT NULL
+    """, (student_id, year_id))
+    if not rows: return None
+    avg = sum(float(r["mark"]) for r in rows) / len(rows)
+    gpa = round(avg / 25, 2)
+    if _q(conn, "SELECT gpa_id FROM GPA WHERE student_id=%s AND school_year_id=%s",
+          (student_id, year_id), one=True):
+        _run(conn, "UPDATE GPA SET value=%s WHERE student_id=%s AND school_year_id=%s",
+             (gpa, student_id, year_id))
+    else:
+        _run(conn, "INSERT INTO GPA (student_id,school_year_id,value) VALUES (%s,%s,%s)",
+             (student_id, year_id, gpa))
+    return gpa
+
+def get_gpa(conn, student_id, year_id=None):
+    if year_id:
+        return _q(conn, "SELECT value,student_rank FROM GPA WHERE student_id=%s AND school_year_id=%s",
+                  (student_id, year_id), one=True)
+    return _q(conn, """
+        SELECT g.value, g.student_rank, a.year_name FROM GPA g
+        JOIN AcademicYear a ON g.school_year_id=a.school_year_id
+        WHERE g.student_id=%s ORDER BY g.school_year_id DESC LIMIT 1
+    """, (student_id,), one=True)
+
+def get_class_gpa_ranking(conn, class_id, year_id=None):
+    if year_id:
+        return _q(conn, """
+            SELECT s.student_id, s.f_name, s.l_name, gpa.value, gpa.student_rank
+            FROM Student s JOIN GPA gpa ON gpa.student_id=s.student_id
+            WHERE s.class_id=%s AND gpa.school_year_id=%s ORDER BY gpa.student_rank
+        """, (class_id, year_id))
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, gpa.value, gpa.student_rank
+        FROM Student s JOIN GPA gpa ON gpa.student_id=s.student_id
+        WHERE s.class_id=%s ORDER BY gpa.value DESC
+    """, (class_id,))
+
+# ═══════════════════════════════════════════════════════════════════
+#  END-OF-YEAR PROCESSING
+# ═══════════════════════════════════════════════════════════════════
+
+def check_finals_pending(conn, year_id):
+    """Legacy wrapper — returns total issue count for backward compatibility."""
+    return check_finals_complete(conn, year_id)["total_issues"]
+
+def process_end_of_year(conn, year_id):
+    check = check_finals_complete(conn, year_id)
+    if check["total_issues"] > 0:
+        parts = []
+        if check["missing_any"]:
+            parts.append(f"{check['missing_any']} student(s) have subjects with no grades entered at all")
+        if check["pending_final"]:
+            parts.append(f"{check['pending_final']} student(s) still have pending final exam grades")
+        return {
+            "blocked": True,
+            "reason":  ". ".join(parts) + ". All final exam grades must be entered before processing.",
+        }
+
+    sems = _q(conn, "SELECT semester_id FROM Semester WHERE school_year_id=%s", (year_id,))
+    sem_ids = [s["semester_id"] for s in sems]
+    if not sem_ids:
+        return {"blocked": True, "reason": "No semesters found for this year."}
+
+    placeholders = ",".join(["%s"] * len(sem_ids))
+    students = _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, c.grade, c.class_id
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='active' ORDER BY c.grade, s.l_name
+    """)
+
+    promoted  = []
+    graduated = []
+    repeated  = []
+    no_data   = []
+
+    for st in students:
+        sid = st["student_id"]
+
+        subject_marks = _q(conn, f"""
+            SELECT sub.name AS subject, g.mark
+            FROM Grades g
+            JOIN Subject  sub ON g.subject_id =sub.subject_id
+            WHERE g.student_id=%s
+              AND g.semester_id IN ({placeholders})
+              AND sub.name!='Physical Education'
+        """, tuple([sid] + sem_ids))
+
+        if not subject_marks:
+            no_data.append(st); continue
+
+        failed_subjects = [r["subject"] for r in subject_marks
+                           if r["mark"] is None or float(r["mark"]) < 60]
+        passed_all = len(failed_subjects) == 0
+
+        calculate_and_save_gpa(conn, sid, year_id)
+
+        if passed_all:
+            if st["grade"] == 12:
+                _run(conn, "UPDATE Student SET status='graduated' WHERE student_id=%s", (sid,))
+                graduated.append({**st, "failed_subjects": []})
+            else:
+                promoted.append({**st, "failed_subjects": []})
+        else:
+            repeated.append({**st, "failed_subjects": failed_subjects})
+
+    _update_class_rankings(conn, year_id)
+
+    return {
+        "blocked":  False,
+        "promoted":  promoted,
+        "graduated": graduated,
+        "repeated":  repeated,
+        "no_data":   no_data,
+        "year_id":   year_id,
+    }
+
+def _update_class_rankings(conn, year_id):
+    for cls in _q(conn, "SELECT class_id FROM Class"):
+        students = _q(conn, """
+            SELECT s.student_id, gpa.value FROM Student s
+            JOIN GPA gpa ON gpa.student_id=s.student_id
+            WHERE s.class_id=%s AND gpa.school_year_id=%s
+            ORDER BY gpa.value DESC
+        """, (cls["class_id"], year_id))
+        for rank, s in enumerate(students, 1):
+            _run(conn, "UPDATE GPA SET student_rank=%s WHERE student_id=%s AND school_year_id=%s",
+                 (rank, s["student_id"], year_id))
+
+# ═══════════════════════════════════════════════════════════════════
+#  ATTENDANCE
+# ═══════════════════════════════════════════════════════════════════
+
+def save_attendance(conn, student_id, att_date, status, semester_id):
+    if _q(conn, "SELECT attendance_id FROM Attendance WHERE student_id=%s AND date=%s",
+          (student_id, att_date), one=True):
+        _run(conn, "UPDATE Attendance SET status=%s WHERE student_id=%s AND date=%s",
+             (status, student_id, att_date))
+    else:
+        _run(conn, "INSERT INTO Attendance (student_id,date,status,semester_id) VALUES (%s,%s,%s,%s)",
+             (student_id, att_date, status, semester_id))
+
+def get_attendance_summary(conn, student_id, semester_id):
+    rows = _q(conn, """
+        SELECT status, COUNT(*) AS n FROM Attendance
+        WHERE student_id=%s AND semester_id=%s GROUP BY status
+    """, (student_id, semester_id))
+    s = {"Present": 0, "Absent": 0, "Late": 0, "Excused": 0, "total": 0}
+    for r in rows:
+        s[r["status"]] = r["n"]; s["total"] += r["n"]
+    s["percentage"] = (
+        round((s["Present"]+s["Late"]+s["Excused"]) / s["total"] * 100, 1)
+        if s["total"] else 0)
+    s["flagged"] = s["percentage"] < 75
+    return s
+
+def get_class_attendance_today(conn, class_id):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, a.status
+        FROM Student s
+        LEFT JOIN Attendance a ON a.student_id=s.student_id AND a.date=CURDATE()
+        WHERE s.class_id=%s AND s.status='active' ORDER BY s.l_name
+    """, (class_id,))
+
+def get_monthly_attendance(conn, student_id, year, month):
+    return _q(conn, """
+        SELECT date, status FROM Attendance
+        WHERE student_id=%s AND YEAR(date)=%s AND MONTH(date)=%s ORDER BY date
+    """, (student_id, year, month))
+
+def get_low_attendance_students(conn, semester_id, threshold=75):
+    return _q(conn, """
+        SELECT s.student_id, s.f_name, s.l_name, c.grade, c.section,
+               COUNT(*) AS total_days,
+               SUM(CASE WHEN a.status IN ('Present','Late','Excused') THEN 1 ELSE 0 END) AS attended,
+               ROUND(SUM(CASE WHEN a.status IN ('Present','Late','Excused') THEN 1 ELSE 0 END)
+                     /COUNT(*)*100,1) AS pct
+        FROM Attendance a
+        JOIN Student s ON a.student_id=s.student_id
+        JOIN Class   c ON s.class_id=c.class_id
+        WHERE a.semester_id=%s AND s.status='active'
+        GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+        HAVING pct < %s ORDER BY pct ASC
+    """, (semester_id, threshold))
+
+# ═══════════════════════════════════════════════════════════════════
+#  ANNOUNCEMENTS
+# ═══════════════════════════════════════════════════════════════════
+
+def send_announcement(conn, sender_id, title, body, target_type, target_id=None):
+    return _run(conn, """
+        INSERT INTO Announcement (sender_id,title,body,target_type,target_id)
+        VALUES (%s,%s,%s,%s,%s)
+    """, (sender_id, title, body, target_type, target_id))
+
+def get_announcements_for_user(conn, user_id, role,
+                                student_id=None, teacher_id=None, class_id=None):
+    conditions = []; params = []
+    if role == "admin":
+        conditions = ["1=1"]
+    elif role == "teacher":
+        conditions = ["a.target_type='all'", "a.target_type='teachers'"]
+        if teacher_id:
+            conditions.append("(a.target_type='teacher' AND a.target_id=%s)")
+            params.append(teacher_id)
+    else:
+        conditions = ["a.target_type='all'", "a.target_type='students'"]
+        if student_id:
+            conditions.append("(a.target_type='student' AND a.target_id=%s)")
+            params.append(student_id)
+        if class_id:
+            conditions.append("(a.target_type='class' AND a.target_id=%s)")
+            params.append(class_id)
+    where = " OR ".join(conditions) if conditions else "1=0"
+    return _q(conn, f"""
+        SELECT a.announcement_id, a.title, a.body,
+               a.target_type, a.target_id, a.created_at,
+               u.user_name AS sender,
+               MAX(CASE WHEN ar.user_id=%s THEN 1 ELSE 0 END) AS is_read
+        FROM Announcement a
+        JOIN User u ON a.sender_id=u.user_id
+        LEFT JOIN AnnouncementRead ar ON ar.announcement_id=a.announcement_id
+        WHERE {where}
+        GROUP BY a.announcement_id ORDER BY a.created_at DESC
+    """, tuple([user_id] + params))
+
+def mark_announcement_read(conn, announcement_id, user_id):
+    _run(conn, "INSERT IGNORE INTO AnnouncementRead (announcement_id,user_id) VALUES (%s,%s)",
+         (announcement_id, user_id))
+
+def delete_announcement(conn, announcement_id):
+    _run(conn, "DELETE FROM Announcement WHERE announcement_id=%s", (announcement_id,))
+
+def get_all_announcements(conn):
+    return _q(conn, """
+        SELECT a.*, u.user_name AS sender, COUNT(ar.id) AS read_count
+        FROM Announcement a
+        JOIN User u ON a.sender_id=u.user_id
+        LEFT JOIN AnnouncementRead ar ON ar.announcement_id=a.announcement_id
+        GROUP BY a.announcement_id ORDER BY a.created_at DESC
+    """)
+
+# ═══════════════════════════════════════════════════════════════════
+#  USER MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════
+
+def get_all_users(conn):
+    return _q(conn, """
+        SELECT u.user_id, u.user_name, u.role,
+               u.student_id, u.teacher_id, u.plain_password,
+               CASE WHEN u.role='student' THEN CONCAT(s.f_name,' ',s.l_name)
+                    WHEN u.role='teacher' THEN CONCAT(t.f_name,' ',t.l_name)
+                    WHEN u.role='admin'   THEN 'Administrator'
+                    ELSE 'N/A' END AS linked_name
+        FROM User u
+        LEFT JOIN Student s ON u.student_id=s.student_id
+        LEFT JOIN Teacher t ON u.teacher_id=t.teacher_id
+        ORDER BY u.role, u.user_name
+    """)
+
+def get_student_credentials(conn):
+    return _q(conn, """
+        SELECT u.user_name, u.plain_password, s.f_name, s.l_name, c.grade, c.section
+        FROM User u JOIN Student s ON u.student_id=s.student_id
+        JOIN Class c ON s.class_id=c.class_id
+        WHERE u.role='student' ORDER BY c.grade, c.section, s.l_name
+    """)
+
+def create_user(conn, username, password, role, student_id=None, teacher_id=None):
+    if _q(conn, "SELECT user_id FROM User WHERE user_name=%s", (username,), one=True):
+        return None, "Username already exists."
+    uid = _run(conn, """
+        INSERT INTO User (user_name,password,plain_password,role,student_id,teacher_id)
+        VALUES (%s,%s,%s,%s,%s,%s)
+    """, (username, _hash(password), password, role, student_id, teacher_id))
+    return uid, "User created."
+
+def auto_create_student_user(conn, student_id, f_name, l_name):
+    base = f"{f_name.lower()}.{l_name.lower()}".replace(" ", "")
+    uname = base; suffix = 2
+    while _q(conn, "SELECT user_id FROM User WHERE user_name=%s", (uname,), one=True):
+        uname = f"{base}{suffix}"; suffix += 1
+    pw = generate_password()
+    _run(conn, """
+        INSERT INTO User (user_name,password,plain_password,role,student_id,teacher_id)
+        VALUES (%s,%s,%s,'student',%s,NULL)
+    """, (uname, _hash(pw), pw, student_id))
+    return uname, pw
+
+def reset_user_password(conn, user_id, new_password=None):
+    pw = new_password or generate_password()
+    _run(conn, "UPDATE User SET password=%s,plain_password=%s WHERE user_id=%s",
+         (_hash(pw), pw, user_id))
+    return pw
+
+def delete_user(conn, user_id):
+    _run(conn, "DELETE FROM User WHERE user_id=%s", (user_id,))
+
+# ═══════════════════════════════════════════════════════════════════
+#  PDF REPORT CARD EXPORT
+# ═══════════════════════════════════════════════════════════════════
+
+def export_report_card_pdf(rc, out_path):
+    """
+    Generate a formatted PDF report card from a get_report_card() dict.
+    Returns out_path on success, raises on failure.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                     Table, TableStyle, HRFlowable)
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+    # ── colour palette (matches the dark-blue app theme) ─────────────
+    NAVY   = colors.HexColor("#1a2744")
+    BLUE   = colors.HexColor("#2563eb")
+    LIGHT  = colors.HexColor("#eff6ff")
+    BORDER = colors.HexColor("#cbd5e1")
+    GREEN  = colors.HexColor("#16a34a")
+    RED    = colors.HexColor("#dc2626")
+    AMBER  = colors.HexColor("#d97706")
+    GREY   = colors.HexColor("#64748b")
+    WHITE  = colors.white
+    BLACK  = colors.HexColor("#0f172a")
+
+    doc = SimpleDocTemplate(
+        out_path, pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2*cm,
+    )
+
+    styles = getSampleStyleSheet()
+    def sty(name, parent="Normal", **kw):
+        return ParagraphStyle(name, parent=styles[parent], **kw)
+
+    S_SCHOOL  = sty("school",  fontSize=22, textColor=NAVY,  leading=26, alignment=TA_CENTER, fontName="Helvetica-Bold")
+    S_SUB     = sty("sub",     fontSize=10, textColor=GREY,  leading=14, alignment=TA_CENTER)
+    S_TITLE   = sty("title",   fontSize=14, textColor=WHITE, leading=18, alignment=TA_CENTER, fontName="Helvetica-Bold")
+    S_LABEL   = sty("label",   fontSize=9,  textColor=GREY,  leading=13, fontName="Helvetica-Bold")
+    S_VALUE   = sty("value",   fontSize=10, textColor=BLACK, leading=14)
+    S_WARN    = sty("warn",    fontSize=9,  textColor=AMBER, leading=13, fontName="Helvetica-Bold")
+    S_TH      = sty("th",      fontSize=9,  textColor=WHITE, leading=12, alignment=TA_CENTER, fontName="Helvetica-Bold")
+    S_TD      = sty("td",      fontSize=9,  textColor=BLACK, leading=12, alignment=TA_CENTER)
+    S_TD_L    = sty("td_l",    fontSize=9,  textColor=BLACK, leading=12, alignment=TA_LEFT)
+    S_FOOTER  = sty("footer",  fontSize=8,  textColor=GREY,  leading=11, alignment=TA_CENTER)
+
+    student  = rc["student"]
+    semester = rc["semester"] or {}
+    att      = rc["attendance"]
+    gpa      = rc["gpa"]
+    grades   = rc["grades"]
+    avg      = rc["average"]
+    avg_let  = rc["average_letter"]
+    pending  = rc["finals_pending"]
+    has_det  = rc["has_detail"]
+    mx       = rc.get("max_components", {})
+
+    sem_label = f"{semester.get('name','')} {semester.get('year_name','')}".strip()
+    stu_name  = f"{student['f_name']} {student['l_name']}"
+    class_lbl = f"Grade {student['grade']}-{student['section']}"
+
+    story = []
+
+    # ── School header ────────────────────────────────────────────────
+    story.append(Paragraph("SIMS Academy", S_SCHOOL))
+    story.append(Paragraph("School Information Management System", S_SUB))
+    story.append(Spacer(1, 0.3*cm))
+    story.append(HRFlowable(width="100%", thickness=2, color=NAVY))
+    story.append(Spacer(1, 0.2*cm))
+
+    # ── Report card banner ───────────────────────────────────────────
+    banner_data = [[Paragraph("OFFICIAL REPORT CARD", S_TITLE)]]
+    banner = Table(banner_data, colWidths=["100%"])
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), NAVY),
+        ("TOPPADDING",    (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ("ROUNDEDCORNERS", [4]),
+    ]))
+    story.append(banner)
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Student info card ────────────────────────────────────────────
+    info_data = [
+        [Paragraph("Student Name", S_LABEL),  Paragraph(stu_name,  S_VALUE),
+         Paragraph("Class",        S_LABEL),  Paragraph(class_lbl, S_VALUE)],
+        [Paragraph("Student ID",   S_LABEL),  Paragraph(str(student["student_id"]), S_VALUE),
+         Paragraph("Semester",     S_LABEL),  Paragraph(sem_label, S_VALUE)],
+        [Paragraph("Gender",       S_LABEL),  Paragraph(student.get("gender","—"), S_VALUE),
+         Paragraph("Date of Birth",S_LABEL),  Paragraph(str(student.get("birth_date","—")), S_VALUE)],
+    ]
+    cw = [3.2*cm, 6.3*cm, 3.2*cm, 4.8*cm]
+    info_tbl = Table(info_data, colWidths=cw)
+    info_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
+        ("BOX",           (0,0), (-1,-1), 1, BORDER),
+        ("INNERGRID",     (0,0), (-1,-1), 0.5, BORDER),
+        ("TOPPADDING",    (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+        ("LEFTPADDING",   (0,0), (-1,-1), 8),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+    ]))
+    story.append(info_tbl)
+    story.append(Spacer(1, 0.4*cm))
+
+    if pending:
+        story.append(Paragraph("⚠  Final exams are still pending — marks will update after entry.", S_WARN))
+        story.append(Spacer(1, 0.2*cm))
+
+    # ── Grades table ─────────────────────────────────────────────────
+    story.append(Paragraph("Academic Performance", sty("h3sec", fontSize=11, textColor=NAVY,
+                                                        fontName="Helvetica-Bold", leading=16)))
+    story.append(Spacer(1, 0.15*cm))
+
+    def val(v, fallback="—"):
+        return str(v) if v is not None else fallback
+
+    if has_det:
+        q1m  = mx.get("quiz1", 10)
+        q2m  = mx.get("quiz2", 10)
+        midm = mx.get("midterm", 20)
+        fnm  = mx.get("final", 60)
+        totm = mx.get("total", 100)
+        headers = [
+            Paragraph("Subject",       S_TH),
+            Paragraph(f"Q1\n/{q1m}",   S_TH),
+            Paragraph(f"Q2\n/{q2m}",   S_TH),
+            Paragraph(f"Mid\n/{midm}", S_TH),
+            Paragraph(f"Final\n/{fnm}",S_TH),
+            Paragraph(f"Total\n/{totm}",S_TH),
+            Paragraph("Grade",         S_TH),
+            Paragraph("Result",        S_TH),
+        ]
+        g_rows = [headers]
+        for r in grades:
+            fn    = r.get("final_exam")
+            raw   = r.get("raw_total")
+            pct   = r.get("pct")
+            fp    = r.get("final_pending")
+            res   = "Pending" if fp else ("Pass" if pct and float(pct) >= 60 else "Fail")
+            res_color = AMBER if fp else (GREEN if res == "Pass" else RED)
+            g_rows.append([
+                Paragraph(r["subject"],              S_TD_L),
+                Paragraph(val(r.get("quiz1")),       S_TD),
+                Paragraph(val(r.get("quiz2")),       S_TD),
+                Paragraph(val(r.get("midterm")),     S_TD),
+                Paragraph("Pending" if fp else val(fn), S_TD),
+                Paragraph("Pending" if fp or raw is None else str(raw), S_TD),
+                Paragraph(r.get("letter_grade","—"), S_TD),
+                Paragraph(res,                       sty(f"res{r['subject']}", fontSize=9,
+                                                         textColor=res_color, leading=12,
+                                                         alignment=TA_CENTER, fontName="Helvetica-Bold")),
+            ])
+        col_w = [5.5*cm, 1.5*cm, 1.5*cm, 1.8*cm, 1.8*cm, 1.8*cm, 1.5*cm, 1.6*cm]
+    else:
+        headers = [
+            Paragraph("Subject",  S_TH),
+            Paragraph("Teacher",  S_TH),
+            Paragraph("Mark %",   S_TH),
+            Paragraph("Grade",    S_TH),
+            Paragraph("Result",   S_TH),
+        ]
+        g_rows = [headers]
+        for r in grades:
+            pct = r.get("pct")
+            res = "Pass" if pct and float(pct) >= 60 else ("—" if not pct else "Fail")
+            res_color = GREEN if res == "Pass" else (GREY if res == "—" else RED)
+            g_rows.append([
+                Paragraph(r["subject"],              S_TD_L),
+                Paragraph(r.get("teacher","—"),      S_TD),
+                Paragraph(val(pct),                  S_TD),
+                Paragraph(r.get("letter_grade","—"), S_TD),
+                Paragraph(res,                       sty(f"res2{r['subject']}", fontSize=9,
+                                                         textColor=res_color, leading=12,
+                                                         alignment=TA_CENTER, fontName="Helvetica-Bold")),
+            ])
+        col_w = [6*cm, 5*cm, 2.5*cm, 2.5*cm, 2*cm]
+
+    g_tbl = Table(g_rows, colWidths=col_w, repeatRows=1)
+    row_count = len(g_rows)
+    g_tbl.setStyle(TableStyle([
+        # header row
+        ("BACKGROUND",    (0,0), (-1,0), BLUE),
+        ("TOPPADDING",    (0,0), (-1,0), 7),
+        ("BOTTOMPADDING", (0,0), (-1,0), 7),
+        # body rows
+        ("ROWBACKGROUNDS",(0,1), (-1,-1), [WHITE, LIGHT]),
+        ("TOPPADDING",    (0,1), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,1), (-1,-1), 5),
+        ("LEFTPADDING",   (0,0), (-1,-1), 6),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 6),
+        # borders
+        ("BOX",           (0,0), (-1,-1), 1, BORDER),
+        ("LINEBELOW",     (0,0), (-1,0),  1, BORDER),
+        ("INNERGRID",     (0,1), (-1,-1), 0.4, BORDER),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(g_tbl)
+    story.append(Spacer(1, 0.5*cm))
+
+    # ── Summary row ──────────────────────────────────────────────────
+    avg_str   = f"{avg}%  ({avg_let})" if avg else "Pending"
+    gpa_str   = f"{gpa['value']}" if gpa else "—"
+    rank_str  = f"#{gpa['student_rank']}" if gpa else "—"
+
+    att_pct   = att.get("percentage", "—")
+    att_str   = f"{att_pct}%"
+    att_flag  = att.get("flagged", False)
+    att_color = RED if att_flag else GREEN
+
+    sum_data = [
+        [Paragraph("Semester Average", S_LABEL),
+         Paragraph(avg_str, sty("avg_v", fontSize=13, textColor=BLUE,
+                                fontName="Helvetica-Bold", leading=16)),
+         Paragraph("GPA", S_LABEL),
+         Paragraph(gpa_str, sty("gpa_v", fontSize=13, textColor=NAVY,
+                                fontName="Helvetica-Bold", leading=16)),
+         Paragraph("Rank", S_LABEL),
+         Paragraph(rank_str, sty("rank_v", fontSize=13, textColor=NAVY,
+                                 fontName="Helvetica-Bold", leading=16)),
+        ],
+        [Paragraph("Attendance", S_LABEL),
+         Paragraph(att_str, sty("att_v", fontSize=13, textColor=att_color,
+                                fontName="Helvetica-Bold", leading=16)),
+         Paragraph("Present", S_LABEL),
+         Paragraph(str(att.get("Present","—")), S_VALUE),
+         Paragraph("Absent", S_LABEL),
+         Paragraph(str(att.get("Absent","—")), sty("abs_v", fontSize=10,
+                   textColor=RED if att.get("Absent",0) else BLACK, leading=14)),
+        ],
+    ]
+    sum_tbl = Table(sum_data, colWidths=[3*cm, 3.5*cm, 2.2*cm, 2.5*cm, 2.2*cm, 4.1*cm])
+    sum_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
+        ("BOX",           (0,0), (-1,-1), 1.5, NAVY),
+        ("INNERGRID",     (0,0), (-1,-1), 0.5, BORDER),
+        ("TOPPADDING",    (0,0), (-1,-1), 7),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+        ("LEFTPADDING",   (0,0), (-1,-1), 10),
+    ]))
+    story.append(sum_tbl)
+
+    if att_flag:
+        story.append(Spacer(1, 0.2*cm))
+        story.append(Paragraph("⚠  Attendance below 75% — student is at risk.", S_WARN))
+
+    # ── Signature line ───────────────────────────────────────────────
+    story.append(Spacer(1, 1.2*cm))
+    sig_data = [[
+        Paragraph("_________________________\nClass Teacher", S_FOOTER),
+        Paragraph("_________________________\nPrincipal / Director", S_FOOTER),
+        Paragraph("_________________________\nParent / Guardian", S_FOOTER),
+    ]]
+    sig_tbl = Table(sig_data, colWidths=["33%","34%","33%"])
+    sig_tbl.setStyle(TableStyle([
+        ("ALIGN",  (0,0), (-1,-1), "CENTER"),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("TOPPADDING", (0,0), (-1,-1), 0),
+    ]))
+    story.append(sig_tbl)
+
+    story.append(Spacer(1, 0.6*cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
+    story.append(Spacer(1, 0.15*cm))
+    story.append(Paragraph(
+        f"Generated by SIMS · {sem_label} · This is an official document.",
+        S_FOOTER))
+
+    doc.build(story)
+    return out_path
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SMART NLP QUERY ENGINE  — no API, no download, instant
+#  Converts free-form English sentences → SQL → live DB results
+# ═══════════════════════════════════════════════════════════════════
+import re as _re
+
+# ── Subquery constants ───────────────────────────────────────────
+_SEM  = "(SELECT semester_id    FROM Semester     ORDER BY semester_id    DESC LIMIT 1)"
+_YEAR = "(SELECT school_year_id FROM AcademicYear ORDER BY school_year_id DESC LIMIT 1)"
+
+# ── Stopwords to strip before matching ──────────────────────────
+_STOP = {"i","want","the","a","an","of","in","for","to","show","me","give",
+         "list","get","find","all","that","are","is","was","were","have",
+         "has","how","many","what","which","who","please","can","you","tell",
+         "number","count","total","students","student","teachers","teacher",
+         "their","from","with","and","or","this","current","latest","active",
+         "semester","class","grade","section","my","do","did","had"}
+
+# ── Entity extractors ────────────────────────────────────────────
+
+def _grade(t):
+    """Extract grade number 7-12."""
+    m = _re.search(r'\b(grade\s*)?([7-9]|1[0-2])\b', t, _re.I)
+    return int(m.group(2)) if m else None
+
+def _section(t):
+    """Extract section A or B."""
+    m = _re.search(r'\bsection\s*([AB])\b|\b([AB])\s*section\b|'
+                   r'\bgrade\s*\d+\s*[-–]?\s*([AB])\b|\b(\d+)\s*[-–]\s*([AB])\b', t, _re.I)
+    if m:
+        for g in m.groups():
+            if g and g.upper() in ('A','B'):
+                return g.upper()
+    return None
+
+def _limit(t, default=10):
+    """Extract top-N number, ignoring grade numbers."""
+    # Remove grade references first
+    clean = _re.sub(r'\b(grade\s*)?([7-9]|1[0-2])\b', '', t, flags=_re.I)
+    m = _re.search(r'\b(\d+)\b', clean)
+    n = int(m.group(1)) if m else default
+    return max(1, min(n, 100))
+
+def _subject(t):
+    """Extract subject name if mentioned."""
+    subjects = ["mathematics","math","science","physics","chemistry","biology",
+                "english","arabic","history","geography","computer","art",
+                "physical education","pe","economics","literature"]
+    tl = t.lower()
+    for s in subjects:
+        if s in tl:
+            if s == "math": return "Mathematics"
+            if s == "pe":   return "Physical Education"
+            return s.title()
+    return None
+
+def _gender(t):
+    tl = t.lower()
+    if any(w in tl for w in ["male","boy","boys","men"]):    return "Male"
+    if any(w in tl for w in ["female","girl","girls","women"]): return "Female"
+    return None
+
+def _has(t, *words):
+    tl = t.lower()
+    return any(w in tl for w in words)
+
+def _all(t, *words):
+    tl = t.lower()
+    return all(w in tl for w in words)
+
+# ── SQL builder helpers ──────────────────────────────────────────
+
+def _grade_filter(g, alias="c"):
+    return f"AND {alias}.grade = {g} " if g else ""
+
+def _section_filter(s, alias="c"):
+    return f"AND {alias}.section = '{s}' " if s else ""
+
+def _subject_filter(sub, alias="sub"):
+    return f"AND {alias}.name = '{sub}' " if sub else ""
+
+# ═══════════════════════════════════════════════════════════════════
+#  INTENT → SQL MAP
+#  Each entry: (intent_id, match_fn, sql_fn)
+#  match_fn(text) → True/False
+#  sql_fn(text)   → SQL string
+# ═══════════════════════════════════════════════════════════════════
+
+def _build_intents():
+    return [
+
+    # ════════════ STUDENT COUNTS ════════════════════════════════
+
+    ("count_students_grade",
+     lambda t: _has(t,"student","pupil") and _grade(t) and _has(t,"how many","number","count","total"),
+     lambda t: f"""
+        SELECT c.grade, c.section,
+               COUNT(s.student_id) AS student_count
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='active' AND c.grade={_grade(t)}
+              {_section_filter(_section(t))}
+        GROUP BY c.grade, c.section
+        ORDER BY c.section"""),
+
+    ("count_students_total",
+     lambda t: _has(t,"how many","number of","count","total") and _has(t,"student","pupil")
+               and not _grade(t) and not _has(t,"fail","absent","pass","attend","gender","male","female","boy","girl"),
+     lambda t: """
+        SELECT
+          SUM(CASE WHEN status='active'    THEN 1 ELSE 0 END) AS active,
+          SUM(CASE WHEN status='graduated' THEN 1 ELSE 0 END) AS graduated,
+          SUM(CASE WHEN status='withdrawn' THEN 1 ELSE 0 END) AS withdrawn,
+          COUNT(*) AS total_all
+        FROM Student"""),
+
+    ("count_per_class",
+     lambda t: _has(t,"how many","number","count") and _has(t,"class","each class","per class"),
+     lambda t: """
+        SELECT c.grade, c.section,
+               COUNT(s.student_id) AS student_count
+        FROM Class c
+        LEFT JOIN Student s ON s.class_id=c.class_id AND s.status='active'
+        GROUP BY c.class_id, c.grade, c.section
+        ORDER BY c.grade, c.section"""),
+
+    # ════════════ LIST STUDENTS ══════════════════════════════════
+
+    ("list_students_grade",
+     lambda t: _has(t,"student","pupil") and _grade(t) and not _has(t,"fail","pass","absent","gpa","average","count","how many","number"),
+     lambda t: f"""
+        SELECT s.student_id,
+               CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               s.gender, c.grade, c.section
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='active' AND c.grade={_grade(t)}
+              {_section_filter(_section(t))}
+        ORDER BY c.section, s.l_name"""),
+
+
+    ("most_absent",
+     lambda t: _has(t,"absent","miss","missed","skip","skipped","absences","most absent"),
+     lambda t: f"""
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               COUNT(*) AS absent_days
+        FROM Attendance a
+        JOIN Student s ON a.student_id=s.student_id
+        JOIN Class c ON s.class_id=c.class_id
+        WHERE a.status='Absent' AND a.semester_id={_SEM}
+          AND s.status='active' {_grade_filter(_grade(t))}
+        GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+        ORDER BY absent_days DESC LIMIT {_limit(t, 20)}"""),
+    ("list_all_students",
+     lambda t: _has(t,"all student","all pupils","list student","show student","every student")
+               and not _grade(t)
+               and not _has(t,"fail","absent","attend","gpa","average","pass","improv","more than","multiple"),
+     lambda t: """
+        SELECT s.student_id,
+               CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section, s.gender, s.status
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='active'
+        ORDER BY c.grade, c.section, s.l_name LIMIT 100"""),
+
+    ("gender_count",
+     lambda t: _has(t,"how many","number","count") and _gender(t),
+     lambda t: f"""
+        SELECT c.grade, c.section,
+               COUNT(*) AS count
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='active'
+          AND s.gender='{_gender(t)}'
+          {_grade_filter(_grade(t))}
+        GROUP BY c.grade, c.section
+        ORDER BY c.grade, c.section"""),
+
+    ("gender_breakdown",
+     lambda t: _has(t,"gender","male","female","boy","girl") and not _has(t,"how many","count"),
+     lambda t: """
+        SELECT c.grade, c.section,
+               SUM(CASE WHEN s.gender='Male'   THEN 1 ELSE 0 END) AS male,
+               SUM(CASE WHEN s.gender='Female' THEN 1 ELSE 0 END) AS female,
+               COUNT(*) AS total
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='active'
+        GROUP BY c.grade, c.section ORDER BY c.grade, c.section"""),
+
+    # ════════════ FAILING / PASSING ══════════════════════════════
+
+    ("count_failing",
+     lambda t: _has(t,"how many","number","count") and _has(t,"fail","failing","failed","not pass","didn't pass"),
+     lambda t: f"""
+        SELECT COUNT(DISTINCT s.student_id) AS failing_students
+        FROM Student s
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Enrollment e ON e.student_id=s.student_id
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id
+                           AND g.subject_id=sub.subject_id
+                           AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id
+                                 AND gd.subject_id=sub.subject_id
+                                 AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND s.status='active'
+          AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) < 60
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+          {_grade_filter(_grade(t))}"""),
+
+
+    ("failing_multiple",
+     lambda t: _has(t,"fail","failing","failed") and _has(t,"more than","at least","multiple","several","2 subject","two subject","more subject"),
+     lambda t: f"""
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               COUNT(*) AS subjects_failed,
+               GROUP_CONCAT(sub.name ORDER BY sub.name SEPARATOR ', ') AS failed_subjects
+        FROM Student s
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Enrollment e ON e.student_id=s.student_id
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id AND g.subject_id=sub.subject_id AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id AND gd.subject_id=sub.subject_id AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND s.status='active'
+          AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) < 60
+          {_grade_filter(_grade(t))}
+        GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+        HAVING subjects_failed >= 2
+        ORDER BY subjects_failed DESC"""),
+    ("failing_students",
+     lambda t: _has(t,"fail","failing","failed","not pass","below 60")
+               and not _has(t,"how many","number","count")
+               and not (_has(t,"teacher") and _has(t,"most","highest")),
+     lambda t: f"""
+        SELECT DISTINCT
+               CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               sub.name AS subject,
+               ROUND(COALESCE(g.mark, gd.total),1) AS mark
+        FROM Student s
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Enrollment e ON e.student_id=s.student_id
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id
+                           AND g.subject_id=sub.subject_id
+                           AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id
+                                 AND gd.subject_id=sub.subject_id
+                                 AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND s.status='active'
+          AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) < 60
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+          {_grade_filter(_grade(t))}
+          {_subject_filter(_subject(t))}
+        ORDER BY c.grade, c.section, mark ASC LIMIT 100"""),
+
+
+    ("passing_students",
+     lambda t: _has(t,"pass","passing","passed") and not _has(t,"fail","how many","count"),
+     lambda t: f"""
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               ROUND(AVG(COALESCE(g.mark,gd.total)),1) AS average_mark
+        FROM Student s
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Enrollment e ON e.student_id=s.student_id
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id AND g.subject_id=sub.subject_id AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id AND gd.subject_id=sub.subject_id AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND s.status='active'
+          AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+          {_grade_filter(_grade(t))}
+        GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+        HAVING MIN(COALESCE(g.mark, gd.total)) >= 60
+        ORDER BY average_mark DESC LIMIT 100"""),
+
+    # ════════════ GPA / RANKINGS ══════════════════════════════════
+
+    ("top_students",
+     lambda t: _has(t,"top","best","highest gpa","highest grade","rank","honour","honor") and not _has(t,"class","average","attendance"),
+     lambda t: f"""
+        SELECT RANK() OVER (ORDER BY gpa.value DESC) AS school_rank,
+               CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               ROUND(gpa.value,2) AS gpa
+        FROM GPA gpa
+        JOIN Student s ON gpa.student_id=s.student_id
+        JOIN Class   c ON s.class_id=c.class_id
+        WHERE gpa.school_year_id={_YEAR} AND s.status='active'
+              {_grade_filter(_grade(t))}
+        ORDER BY gpa.value DESC
+        LIMIT {_limit(t, 10)}"""),
+
+    ("class_ranking",
+     lambda t: _has(t,"rank","ranking","top","best") and _has(t,"class") and _grade(t),
+     lambda t: f"""
+        SELECT RANK() OVER (ORDER BY AVG(COALESCE(g.mark,gd.total)) DESC) AS class_rank,
+               CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.section,
+               ROUND(AVG(COALESCE(g.mark,gd.total)),2) AS average_mark
+        FROM Student s
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Enrollment e ON e.student_id=s.student_id
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id AND g.subject_id=sub.subject_id AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id AND gd.subject_id=sub.subject_id AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND c.grade={_grade(t)}
+          AND s.status='active' AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+        GROUP BY s.student_id, s.f_name, s.l_name, c.section
+        ORDER BY class_rank"""),
+
+    ("gpa_history",
+     lambda t: _has(t,"gpa","grade point") and _has(t,"history","over","years","trend","progress"),
+     lambda t: f"""
+        SELECT a.year_name, ROUND(gpa.value,2) AS gpa, gpa.student_rank AS rank
+        FROM GPA gpa
+        JOIN AcademicYear a ON gpa.school_year_id=a.school_year_id
+        JOIN Student s ON gpa.student_id=s.student_id
+        WHERE s.status='active'
+        ORDER BY a.school_year_id
+        LIMIT 100"""),
+
+    # ════════════ AVERAGES ════════════════════════════════════════
+
+    ("avg_by_class",
+     lambda t: _has(t,"average","avg","mean") and _has(t,"class","per class","each class") and not _has(t,"subject"),
+     lambda t: f"""
+        SELECT c.grade, c.section,
+               ROUND(AVG(COALESCE(g.mark,gd.total)),2) AS class_average,
+               COUNT(DISTINCT s.student_id) AS students
+        FROM Student s
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Enrollment e ON e.student_id=s.student_id
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id AND g.subject_id=sub.subject_id AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id AND gd.subject_id=sub.subject_id AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND s.status='active'
+          AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+          {_grade_filter(_grade(t))}
+        GROUP BY c.class_id, c.grade, c.section
+        ORDER BY class_average DESC"""),
+
+    ("avg_by_subject",
+     lambda t: _has(t,"average","avg","mean") and _has(t,"subject","course","per subject","each subject"),
+     lambda t: f"""
+        SELECT sub.name AS subject,
+               ROUND(AVG(COALESCE(g.mark,gd.total)),2) AS average_mark,
+               COUNT(DISTINCT s.student_id) AS students,
+               SUM(CASE WHEN COALESCE(g.mark,gd.total) < 60 THEN 1 ELSE 0 END) AS failing
+        FROM Subject sub
+        JOIN Enrollment e ON e.subject_id=sub.subject_id
+        JOIN Student s ON e.student_id=s.student_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id AND g.subject_id=sub.subject_id AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id AND gd.subject_id=sub.subject_id AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+          {_subject_filter(_subject(t))}
+        GROUP BY sub.subject_id, sub.name
+        ORDER BY average_mark DESC"""),
+
+    ("avg_grade_class",
+     lambda t: _has(t,"average","avg") and _grade(t) and not _has(t,"subject"),
+     lambda t: f"""
+        SELECT c.grade, c.section,
+               ROUND(AVG(COALESCE(g.mark,gd.total)),2) AS average_mark,
+               MIN(COALESCE(g.mark,gd.total)) AS lowest,
+               MAX(COALESCE(g.mark,gd.total)) AS highest
+        FROM Student s
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Enrollment e ON e.student_id=s.student_id
+        JOIN Subject sub ON e.subject_id=sub.subject_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id AND g.subject_id=sub.subject_id AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id AND gd.subject_id=sub.subject_id AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND c.grade={_grade(t)}
+          AND s.status='active' AND sub.name != 'Physical Education'
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+          {_section_filter(_section(t))}
+        GROUP BY c.grade, c.section"""),
+
+    ("grade_distribution",
+     lambda t: _has(t,"distribution","breakdown","a grade","b grade","how many a","letter grade"),
+     lambda t: f"""
+        SELECT sub.name AS subject,
+               SUM(CASE WHEN g.status='A' THEN 1 ELSE 0 END) AS A,
+               SUM(CASE WHEN g.status='B' THEN 1 ELSE 0 END) AS B,
+               SUM(CASE WHEN g.status='C' THEN 1 ELSE 0 END) AS C,
+               SUM(CASE WHEN g.status='D' THEN 1 ELSE 0 END) AS D,
+               SUM(CASE WHEN g.status='F' THEN 1 ELSE 0 END) AS F,
+               ROUND(AVG(g.mark),1) AS avg_pct
+        FROM Grades g JOIN Subject sub ON g.subject_id=sub.subject_id
+        WHERE g.semester_id={_SEM} AND sub.name != 'Physical Education'
+        GROUP BY sub.subject_id, sub.name ORDER BY avg_pct DESC"""),
+
+    ("improvement",
+     lambda t: _has(t,"improv","progress","better","increased","grew","rise","risen"),
+     lambda t: f"""
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               ROUND(AVG(CASE WHEN g.semester_id=s1.sid THEN g.mark END),1) AS sem1_avg,
+               ROUND(AVG(CASE WHEN g.semester_id=s2.sid THEN g.mark END),1) AS sem2_avg,
+               ROUND(
+                 AVG(CASE WHEN g.semester_id=s2.sid THEN g.mark END) -
+                 AVG(CASE WHEN g.semester_id=s1.sid THEN g.mark END)
+               ,1) AS improvement
+        FROM Grades g
+        JOIN Student s ON g.student_id=s.student_id
+        JOIN Class c ON s.class_id=c.class_id
+        JOIN Subject sub ON g.subject_id=sub.subject_id
+        JOIN (SELECT semester_id AS sid FROM Semester
+              WHERE semester_id IN (SELECT semester_id FROM Grades GROUP BY semester_id HAVING COUNT(*)>0)
+              ORDER BY semester_id DESC LIMIT 1 OFFSET 1) s1 ON 1=1
+        JOIN (SELECT semester_id AS sid FROM Semester
+              WHERE semester_id IN (SELECT semester_id FROM Grades GROUP BY semester_id HAVING COUNT(*)>0)
+              ORDER BY semester_id DESC LIMIT 1) s2 ON 1=1
+        WHERE sub.name != 'Physical Education' AND s.status='active'
+              {_grade_filter(_grade(t))}
+        GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+        HAVING sem1_avg IS NOT NULL AND sem2_avg IS NOT NULL
+           AND improvement IS NOT NULL
+        ORDER BY improvement DESC LIMIT {_limit(t, 20)}"""),
+
+    # ════════════ ATTENDANCE ══════════════════════════════════════
+
+    ("attendance_risk",
+     lambda t: _has(t,"below 75","low attendance","attendance risk","attendance problem","at risk") or
+               (_has(t,"attend") and _has(t,"below","under","less than","risk","problem")),
+     lambda t: f"""
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               ROUND(SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END)*100.0/COUNT(*),1) AS attendance_pct,
+               SUM(CASE WHEN a.status='Absent' THEN 1 ELSE 0 END) AS absent_days
+        FROM Attendance a
+        JOIN Student s ON a.student_id=s.student_id
+        JOIN Class c ON s.class_id=c.class_id
+        WHERE a.semester_id={_SEM} AND s.status='active'
+              {_grade_filter(_grade(t))}
+        GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+        HAVING attendance_pct < 75
+        ORDER BY attendance_pct ASC"""),
+
+
+    ("attendance_today",
+     lambda t: _has(t,"today") and _has(t,"attend","present","absent"),
+     lambda t: """
+        SELECT a.status, COUNT(*) AS count
+        FROM Attendance a WHERE a.date=CURDATE()
+        GROUP BY a.status"""),
+
+    ("attendance_summary",
+     lambda t: _has(t,"attend") and _has(t,"summary","overview","report","per class","by class","each class"),
+     lambda t: f"""
+        SELECT c.grade, c.section,
+               COUNT(*) AS total_records,
+               SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END) AS present,
+               SUM(CASE WHEN a.status='Absent'  THEN 1 ELSE 0 END) AS absent,
+               ROUND(SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END)*100.0/COUNT(*),1) AS pct
+        FROM Attendance a
+        JOIN Student s ON a.student_id=s.student_id
+        JOIN Class c ON s.class_id=c.class_id
+        WHERE a.semester_id={_SEM} {_grade_filter(_grade(t))}
+        GROUP BY c.class_id, c.grade, c.section
+        ORDER BY pct ASC"""),
+
+    ("count_absent_today",
+     lambda t: _has(t,"how many","number") and _has(t,"absent") and _has(t,"today"),
+     lambda t: """
+        SELECT COUNT(*) AS absent_today
+        FROM Attendance WHERE status='Absent' AND date=CURDATE()"""),
+
+    # ════════════ TEACHERS ════════════════════════════════════════
+
+    ("teacher_with_most_failing",
+     lambda t: _has(t,"teacher") and _has(t,"most fail","highest fail","fail"),
+     lambda t: f"""
+        SELECT CONCAT(t.f_name,' ',t.l_name) AS teacher_name,
+               sub.name AS subject,
+               COUNT(DISTINCT s.student_id) AS failing_students
+        FROM Teacher t
+        JOIN Subject sub ON sub.teacher_id=t.teacher_id
+        JOIN Enrollment e ON e.subject_id=sub.subject_id
+        JOIN Student s ON e.student_id=s.student_id
+        LEFT JOIN Grades g ON g.student_id=s.student_id AND g.subject_id=sub.subject_id AND g.semester_id={_SEM}
+        LEFT JOIN GradeDetail gd ON gd.student_id=s.student_id AND gd.subject_id=sub.subject_id AND gd.semester_id={_SEM}
+        WHERE sub.semester_id={_SEM} AND s.status='active'
+          AND COALESCE(g.mark, gd.total) < 60
+          AND COALESCE(g.mark, gd.total) IS NOT NULL
+        GROUP BY t.teacher_id, t.f_name, t.l_name, sub.name
+        ORDER BY failing_students DESC LIMIT 10"""),
+
+    ("teacher_workload",
+     lambda t: _has(t,"teacher") and _has(t,"workload","load","how many student","teach","subject"),
+     lambda t: f"""
+        SELECT CONCAT(t.f_name,' ',t.l_name) AS teacher_name,
+               COUNT(DISTINCT sub.subject_id) AS subjects,
+               COUNT(DISTINCT e.student_id)   AS students_taught
+        FROM Teacher t
+        JOIN Subject sub ON sub.teacher_id=t.teacher_id AND sub.semester_id={_SEM}
+        JOIN Enrollment e ON e.subject_id=sub.subject_id
+        GROUP BY t.teacher_id, t.f_name, t.l_name
+        ORDER BY students_taught DESC"""),
+
+    ("all_teachers",
+     lambda t: _has(t,"all teacher","list teacher","show teacher","every teacher"),
+     lambda t: f"""
+        SELECT CONCAT(t.f_name,' ',t.l_name) AS teacher_name,
+               t.email, t.gender,
+               COUNT(DISTINCT sub.subject_id) AS subjects_this_semester
+        FROM Teacher t
+        LEFT JOIN Subject sub ON sub.teacher_id=t.teacher_id AND sub.semester_id={_SEM}
+        GROUP BY t.teacher_id, t.f_name, t.l_name, t.email, t.gender
+        ORDER BY t.l_name"""),
+
+    ("teacher_subjects",
+     lambda t: _has(t,"teacher") and _has(t,"subject","teach","what"),
+     lambda t: f"""
+        SELECT CONCAT(t.f_name,' ',t.l_name) AS teacher_name,
+               sub.name AS subject,
+               c.grade, c.section,
+               COUNT(DISTINCT e.student_id) AS students
+        FROM Teacher t
+        JOIN Subject sub ON sub.teacher_id=t.teacher_id AND sub.semester_id={_SEM}
+        JOIN Enrollment e ON e.subject_id=sub.subject_id
+        JOIN Student s ON e.student_id=s.student_id
+        JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='active'
+        GROUP BY t.teacher_id, t.f_name, t.l_name, sub.name, c.grade, c.section
+        ORDER BY t.l_name, c.grade"""),
+
+    # ════════════ CLASS SIZES & OVERVIEW ═════════════════════════
+
+    ("class_sizes",
+     lambda t: _has(t,"class size","size of class","students in each","students per class","largest","smallest"),
+     lambda t: """
+        SELECT c.grade, c.section,
+               CONCAT(t.f_name,' ',t.l_name) AS homeroom_teacher,
+               COUNT(s.student_id) AS student_count
+        FROM Class c
+        LEFT JOIN Teacher t ON c.homeroom_teacher_id=t.teacher_id
+        LEFT JOIN Student s ON s.class_id=c.class_id AND s.status='active'
+        GROUP BY c.class_id, c.grade, c.section, t.f_name, t.l_name
+        ORDER BY student_count DESC"""),
+
+    ("school_overview",
+     lambda t: _has(t,"overview","summary","dashboard","statistics","snapshot","kpi","school stat"),
+     lambda t: f"""
+        SELECT
+         (SELECT COUNT(*) FROM Student WHERE status='active')    AS active_students,
+         (SELECT COUNT(*) FROM Student WHERE status='graduated') AS graduated,
+         (SELECT COUNT(*) FROM Student WHERE status='withdrawn') AS withdrawn,
+         (SELECT COUNT(*) FROM Teacher)                          AS teachers,
+         (SELECT COUNT(*) FROM Class)                            AS classes,
+         (SELECT CONCAT(s.name,' ',a.year_name)
+          FROM Semester s JOIN AcademicYear a ON s.school_year_id=a.school_year_id
+          ORDER BY s.semester_id DESC LIMIT 1)                  AS active_semester,
+         (SELECT COUNT(*) FROM GradeDetail
+          WHERE final_exam IS NULL AND semester_id={_SEM})       AS finals_pending"""),
+
+    ("pending_finals",
+     lambda t: _has(t,"pending","missing final","no final","final not entered","incomplete"),
+     lambda t: f"""
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section, sub.name AS subject
+        FROM GradeDetail gd
+        JOIN Student s ON gd.student_id=s.student_id
+        JOIN Subject sub ON gd.subject_id=sub.subject_id
+        JOIN Class c ON s.class_id=c.class_id
+        WHERE gd.semester_id={_SEM} AND gd.final_exam IS NULL
+          AND s.status='active' {_grade_filter(_grade(t))}
+        ORDER BY c.grade, c.section, s.l_name LIMIT 100"""),
+
+    ("count_pending",
+     lambda t: _has(t,"how many","number","count") and _has(t,"pending","missing final"),
+     lambda t: f"""
+        SELECT COUNT(DISTINCT student_id) AS students_with_pending_finals
+        FROM GradeDetail
+        WHERE semester_id={_SEM} AND final_exam IS NULL"""),
+
+    ("withdrawn",
+     lambda t: _has(t,"withdrawn","withdrew","drop out","dropped out"),
+     lambda t: """
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section, s.enrollment_year
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        WHERE s.status='withdrawn' ORDER BY s.l_name"""),
+
+    ("graduated",
+     lambda t: _has(t,"graduated","graduation","graduate","alumni"),
+     lambda t: """
+        SELECT CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section,
+               ROUND(gpa.value,2) AS final_gpa
+        FROM Student s JOIN Class c ON s.class_id=c.class_id
+        LEFT JOIN GPA gpa ON gpa.student_id=s.student_id
+        WHERE s.status='graduated'
+        ORDER BY gpa.value DESC NULLS LAST"""),
+
+    ("announcements",
+     lambda t: _has(t,"announcement","notice","bulletin","message"),
+     lambda t: """
+        SELECT a.title, a.target_type, a.created_at,
+               u.user_name AS posted_by
+        FROM Announcement a JOIN User u ON a.sender_id=u.user_id
+        ORDER BY a.created_at DESC LIMIT 20"""),
+
+    ]
+
+
+def _parse_and_build(text, role="admin", teacher_id=None):
+    """
+    Parse free-form English text, match intent, build SQL.
+    Returns (intent_id, sql) or (None, None).
+    """
+    t = text.strip().lower()
+
+    for intent_id, match_fn, sql_fn in _build_intents():
+        try:
+            if match_fn(t):
+                sql = sql_fn(t).strip()
+                # Teacher role: scope to their subjects
+                if role == "teacher" and teacher_id and "sub.teacher_id" not in sql:
+                    if "Subject sub" in sql and "JOIN Subject" in sql:
+                        sql = sql.replace(
+                            f"WHERE sub.semester_id={_SEM}",
+                            f"WHERE sub.semester_id={_SEM} AND sub.teacher_id={teacher_id}"
+                        ).replace(
+                            "WHERE sub.name",
+                            f"WHERE sub.teacher_id={teacher_id} AND sub.name"
+                        )
+                return intent_id, sql
+        except Exception:
+            continue
+    return None, None
+
+
+def run_query_assistant(conn, user_question, role="admin", teacher_id=None):
+    """
+    Convert a natural language question → SQL → execute → return results.
+    No API, no download, instant.
+    """
+    intent_id, sql = _parse_and_build(user_question, role, teacher_id)
+
+    if not sql:
+        return {"label": None, "sql": None, "columns": [], "rows": [],
+                "summary": None, "matched": False, "error": None}
+
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        cur.close()
+    except Exception as e:
+        return {"label": intent_id, "sql": sql, "columns": [], "rows": [],
+                "summary": None, "matched": True, "error": f"Query error: {e}"}
+
+    n = len(rows)
+    if n == 0:
+        summary = "No results found."
+    elif n == 1 and len(cols) == 1:
+        val = list(rows[0].values())[0]
+        summary = f"Result: {val}"
+    else:
+        summary = f"{n} row{'s' if n != 1 else ''} returned."
+
+    return {"label": intent_id, "sql": sql, "columns": cols, "rows": rows,
+            "summary": summary, "matched": True, "error": None}
+
+# ═══════════════════════════════════════════════════════════════════
+#  PHONE NUMBER MANAGEMENT (normalised — ContactPhone table)
+# ═══════════════════════════════════════════════════════════════════
+#  ContactPhone: (phone_id, entity_type, entity_id, phone_number, label)
+#  entity_type = 'teacher' | 'guardian'
+#  label       = 'Primary' | 'Secondary' | 'Work' | 'Mobile'
+
+def get_phones(conn, entity_type, entity_id):
+    return _q(conn, """
+        SELECT phone_id, phone_number, label
+        FROM ContactPhone
+        WHERE entity_type=%s AND entity_id=%s
+        ORDER BY phone_id
+    """, (entity_type, entity_id))
+
+def save_phones(conn, entity_type, entity_id, phones):
+    """phones = list of (phone_number, label) tuples. Replaces existing."""
+    _run(conn, "DELETE FROM ContactPhone WHERE entity_type=%s AND entity_id=%s",
+         (entity_type, entity_id))
+    for number, label in phones:
+        if number and number.strip():
+            _run(conn, """
+                INSERT INTO ContactPhone (entity_type, entity_id, phone_number, label)
+                VALUES (%s,%s,%s,%s)
+            """, (entity_type, entity_id, number.strip(), label or "Primary"))
+
+def get_primary_phone(conn, entity_type, entity_id):
+    r = _q(conn, """
+        SELECT phone_number FROM ContactPhone
+        WHERE entity_type=%s AND entity_id=%s
+        ORDER BY phone_id LIMIT 1
+    """, (entity_type, entity_id), one=True)
+    return r["phone_number"] if r else "—"
+
+# ═══════════════════════════════════════════════════════════════════
+#  ENROLLMENT MANAGEMENT  (admin UI)
+# ═══════════════════════════════════════════════════════════════════
+
+def get_class_subjects_for_semester(conn, class_id, semester_id):
+    """All subjects for a given class in the given semester."""
+    return _q(conn, """
+        SELECT DISTINCT sub.subject_id, sub.name,
+               CONCAT(t.f_name,' ',t.l_name) AS teacher_name,
+               t.teacher_id,
+               COUNT(e.enrollment_id) AS enrolled_students
+        FROM Subject sub
+        JOIN Teacher t ON sub.teacher_id = t.teacher_id
+        LEFT JOIN Enrollment e ON e.subject_id = sub.subject_id
+        LEFT JOIN Student s ON e.student_id = s.student_id AND s.class_id = %s
+        WHERE sub.semester_id = %s
+          AND sub.subject_id IN (
+              SELECT sub2.subject_id FROM Subject sub2
+              JOIN Enrollment e2 ON e2.subject_id = sub2.subject_id
+              JOIN Student s2 ON e2.student_id = s2.student_id
+              WHERE s2.class_id = %s AND sub2.semester_id = %s
+          )
+        GROUP BY sub.subject_id, sub.name, t.teacher_id, t.f_name, t.l_name
+        ORDER BY sub.name
+    """, (class_id, semester_id, class_id, semester_id))
+
+def get_unenrolled_students(conn, subject_id):
+    """Students in the same class but not enrolled in a given subject."""
+    return _q(conn, """
+        SELECT s.student_id, CONCAT(s.f_name,' ',s.l_name) AS student_name,
+               c.grade, c.section
+        FROM Student s
+        JOIN Class c ON s.class_id = c.class_id
+        JOIN Subject sub ON sub.subject_id = %s
+        JOIN Enrollment e_any ON e_any.subject_id = sub.subject_id
+        JOIN Student ref ON e_any.student_id = ref.student_id
+        WHERE s.class_id = ref.class_id
+          AND s.status = 'active'
+          AND s.student_id NOT IN (
+              SELECT e.student_id FROM Enrollment e WHERE e.subject_id = %s
+          )
+        GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+        ORDER BY s.l_name
+        LIMIT 1
+    """, (subject_id, subject_id), one=True)  # just to detect if any exist
+
+def bulk_enroll_class(conn, class_id, semester_id):
+    """Enroll all active students in a class into all subjects for that semester.
+    Safe to call multiple times — uses INSERT IGNORE.
+    Returns count of new enrollments created."""
+    subjects = _q(conn, """
+        SELECT DISTINCT sub.subject_id
+        FROM Subject sub
+        WHERE sub.semester_id = %s
+          AND EXISTS (
+            SELECT 1 FROM Enrollment e
+            JOIN Student s ON e.student_id = s.student_id
+            WHERE e.subject_id = sub.subject_id AND s.class_id = %s
+          )
+    """, (semester_id, class_id))
+
+    students = _q(conn, """
+        SELECT student_id FROM Student
+        WHERE class_id = %s AND status = 'active'
+    """, (class_id,))
+
+    count = 0
+    for sub in subjects:
+        for stu in students:
+            existing = _q(conn,
+                "SELECT enrollment_id FROM Enrollment WHERE student_id=%s AND subject_id=%s",
+                (stu["student_id"], sub["subject_id"]), one=True)
+            if not existing:
+                _run(conn, "INSERT INTO Enrollment (student_id,subject_id) VALUES (%s,%s)",
+                     (stu["student_id"], sub["subject_id"]))
+                count += 1
+    return count
+
+def assign_teacher_to_subject(conn, subject_id, teacher_id):
+    """Reassign a teacher to a subject."""
+    _run(conn, "UPDATE Subject SET teacher_id=%s WHERE subject_id=%s",
+         (teacher_id, subject_id))
+
+def update_homeroom_teacher(conn, class_id, teacher_id):
+    """Change homeroom teacher for a class."""
+    _run(conn, "UPDATE Class SET homeroom_teacher_id=%s WHERE class_id=%s",
+         (teacher_id, class_id))
+
+def get_all_subjects_for_semester(conn, semester_id):
+    """All subjects in a semester with teacher and enrollment count."""
+    return _q(conn, """
+        SELECT sub.subject_id, sub.name,
+               CONCAT(t.f_name,' ',t.l_name) AS teacher_name,
+               t.teacher_id,
+               COUNT(DISTINCT e.student_id) AS enrolled_students
+        FROM Subject sub
+        JOIN Teacher t ON sub.teacher_id = t.teacher_id
+        LEFT JOIN Enrollment e ON e.subject_id = sub.subject_id
+        WHERE sub.semester_id = %s
+        GROUP BY sub.subject_id, sub.name, t.teacher_id, t.f_name, t.l_name
+        ORDER BY sub.name, t.l_name
+    """, (semester_id,))
+
+# ═══════════════════════════════════════════════════════════════════
+#  IMPROVED FINALS CHECK  — catches enrolled students with NO GradeDetail row
+# ═══════════════════════════════════════════════════════════════════
+
+def check_finals_complete(conn, year_id):
+    """
+    Returns dict with counts:
+      - missing_any:  students with no GradeDetail at all for any subject
+      - pending_final: students who have GradeDetail but final_exam IS NULL
+      - total_issues: sum of above
+    Promotion should only proceed when total_issues == 0.
+    """
+    sems = _q(conn, "SELECT semester_id FROM Semester WHERE school_year_id=%s", (year_id,))
+    if not sems:
+        return {"missing_any": 0, "pending_final": 0, "total_issues": 0, "sem_ids": []}
+    sem_ids = [s["semester_id"] for s in sems]
+    ph = ",".join(["%s"] * len(sem_ids))
+
+    # Students enrolled in a subject this year but have NO GradeDetail row at all
+    missing = _q(conn, f"""
+        SELECT COUNT(DISTINCT e.student_id) AS n
+        FROM Enrollment e
+        JOIN Subject sub ON e.subject_id = sub.subject_id
+        JOIN Student s ON e.student_id = s.student_id
+        WHERE sub.semester_id IN ({ph})
+          AND s.status = 'active'
+          AND sub.name != 'Physical Education'
+          AND NOT EXISTS (
+              SELECT 1 FROM GradeDetail gd
+              WHERE gd.student_id = e.student_id
+                AND gd.subject_id = sub.subject_id
+                AND gd.semester_id = sub.semester_id
+          )
+    """, tuple(sem_ids), one=True)
+
+    # Students who have GradeDetail but final_exam is NULL
+    pending = _q(conn, f"""
+        SELECT COUNT(DISTINCT gd.student_id) AS n
+        FROM GradeDetail gd
+        JOIN Student s ON gd.student_id = s.student_id
+        WHERE gd.semester_id IN ({ph})
+          AND gd.final_exam IS NULL
+          AND s.status = 'active'
+    """, tuple(sem_ids), one=True)
+
+    m = missing["n"] if missing else 0
+    p = pending["n"] if pending else 0
+    return {
+        "missing_any":   m,
+        "pending_final": p,
+        "total_issues":  m + p,
+        "sem_ids":       sem_ids,
+    }

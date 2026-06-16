@@ -1,0 +1,748 @@
+DROP DATABASE sims;
+CREATE DATABASE sims;
+USE sims;
+
+-- ================================================================
+-- CORE TABLES
+-- ================================================================
+
+-- ── Academic Year ─────────────────────────────────────────────────
+CREATE TABLE AcademicYear (
+    school_year_id INT AUTO_INCREMENT PRIMARY KEY,
+    year_name      VARCHAR(20) NOT NULL,
+    UNIQUE KEY uq_year_name (year_name)          -- FIX 1: prevent duplicate years
+);
+
+-- ── Semester ──────────────────────────────────────────────────────
+CREATE TABLE Semester (
+    semester_id    INT AUTO_INCREMENT PRIMARY KEY,
+    name           VARCHAR(20) NOT NULL,
+    school_year_id INT NOT NULL,
+    UNIQUE KEY uq_semester (name, school_year_id), -- FIX 2: prevent duplicate semesters per year
+    FOREIGN KEY (school_year_id) REFERENCES AcademicYear(school_year_id)
+        ON DELETE CASCADE
+);
+
+-- ── Teacher ───────────────────────────────────────────────────────
+CREATE TABLE Teacher (
+    teacher_id INT AUTO_INCREMENT PRIMARY KEY,
+    f_name     VARCHAR(50),
+    l_name     VARCHAR(50),
+    email      VARCHAR(100) UNIQUE,
+    phone_no   VARCHAR(20),
+    gender     VARCHAR(10),
+    birth_date DATE
+);
+
+-- ── Class ─────────────────────────────────────────────────────────
+CREATE TABLE Class (
+    class_id            INT AUTO_INCREMENT PRIMARY KEY,
+    grade               INT     NOT NULL,
+    section             CHAR(1) NOT NULL,
+    homeroom_teacher_id INT,
+    FOREIGN KEY (homeroom_teacher_id) REFERENCES Teacher(teacher_id)
+        ON DELETE SET NULL
+);
+
+-- ── Guardian ──────────────────────────────────────────────────────
+CREATE TABLE Guardian (
+    guardian_id INT AUTO_INCREMENT PRIMARY KEY,
+    f_name      VARCHAR(50),
+    l_name      VARCHAR(50),
+    phone_no    VARCHAR(20),
+    gender      VARCHAR(10)
+);
+
+-- ── Student ───────────────────────────────────────────────────────
+-- FIX 7: added status and enrollment_year used in many queries
+CREATE TABLE Student (
+    student_id      INT AUTO_INCREMENT PRIMARY KEY,
+    f_name          VARCHAR(50),
+    l_name          VARCHAR(50),
+    gender          VARCHAR(10),
+    birth_date      DATE,
+    address         TEXT,
+    guardian_id     INT,
+    class_id        INT,
+    status          VARCHAR(20) NOT NULL DEFAULT 'active',    -- FIX 7a
+    enrollment_year INT        NULL,                          -- FIX 7b
+    FOREIGN KEY (guardian_id) REFERENCES Guardian(guardian_id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (class_id)    REFERENCES Class(class_id)
+        ON DELETE SET NULL
+);
+
+-- ── Subject ───────────────────────────────────────────────────────
+CREATE TABLE Subject (
+    subject_id  INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(50) NOT NULL,
+    teacher_id  INT,
+    semester_id INT NOT NULL,
+    FOREIGN KEY (teacher_id)  REFERENCES Teacher(teacher_id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (semester_id) REFERENCES Semester(semester_id)
+        ON DELETE CASCADE
+);
+
+-- ── Enrollment ────────────────────────────────────────────────────
+-- NOTE on FIX 9:
+--   subject_id already encodes the semester (each Subject row belongs to
+--   exactly one semester_id). Therefore UNIQUE(student_id, subject_id)
+--   already prevents the same student from enrolling in the same subject
+--   in the same semester twice, AND allows the same student to enroll in
+--   a subject with the same name in a different semester (because that
+--   will be a different subject_id). The original key is correct.
+CREATE TABLE Enrollment (
+    enrollment_id INT AUTO_INCREMENT PRIMARY KEY,
+    student_id    INT NOT NULL,
+    subject_id    INT NOT NULL,
+    UNIQUE KEY uq_enrollment (student_id, subject_id),
+    FOREIGN KEY (student_id) REFERENCES Student(student_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (subject_id) REFERENCES Subject(subject_id)
+        ON DELETE CASCADE
+);
+
+-- ── Grades ────────────────────────────────────────────────────────
+-- FIX 6: Grades stores ONLY the final computed percentage (0-100).
+--   For detailed semesters: synced from GradeDetail when final_exam is entered.
+--   For historical semesters: entered directly as a simple mark.
+--   mark is DECIMAL to hold percentage values like 87.5.
+CREATE TABLE Grades (
+    grade_id    INT AUTO_INCREMENT PRIMARY KEY,
+    student_id  INT NOT NULL,
+    subject_id  INT NOT NULL,
+    semester_id INT NOT NULL,
+    mark        DECIMAL(5,2) CHECK (mark BETWEEN 0 AND 100),
+    status      VARCHAR(10),
+    UNIQUE KEY uq_grade (student_id, subject_id, semester_id),
+    FOREIGN KEY (student_id)  REFERENCES Student(student_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (subject_id)  REFERENCES Subject(subject_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (semester_id) REFERENCES Semester(semester_id)
+        ON DELETE CASCADE
+);
+
+-- ── GradeDetail ───────────────────────────────────────────────────
+-- FIX 4: total is stored (computed) but protected by CHECK constraints.
+--   Logic layer recomputes it every save so it stays in sync.
+-- FIX 5: CHECK constraints enforce max per component.
+-- Weights: quiz1(10) + quiz2(10) + midterm(20) + final(60) = 100 raw → /100 pct
+CREATE TABLE GradeDetail (
+    detail_id   INT AUTO_INCREMENT PRIMARY KEY,
+    student_id  INT NOT NULL,
+    subject_id  INT NOT NULL,
+    semester_id INT NOT NULL,
+    quiz1       DECIMAL(5,2) NULL CHECK (quiz1    IS NULL OR (quiz1    >= 0 AND quiz1    <= 10)),
+    quiz2       DECIMAL(5,2) NULL CHECK (quiz2    IS NULL OR (quiz2    >= 0 AND quiz2    <= 10)),
+    midterm     DECIMAL(5,2) NULL CHECK (midterm  IS NULL OR (midterm  >= 0 AND midterm  <= 20)),
+    final_exam  DECIMAL(5,2) NULL CHECK (final_exam IS NULL OR (final_exam >= 0 AND final_exam <= 60)),
+    total       DECIMAL(5,2) NULL CHECK (total    IS NULL OR (total    >= 0 AND total    <= 100)),
+    UNIQUE KEY uq_detail (student_id, subject_id, semester_id),
+    FOREIGN KEY (student_id)  REFERENCES Student(student_id)  ON DELETE CASCADE,
+    FOREIGN KEY (subject_id)  REFERENCES Subject(subject_id)  ON DELETE CASCADE,
+    FOREIGN KEY (semester_id) REFERENCES Semester(semester_id) ON DELETE CASCADE
+);
+
+-- ── SubjectResult ─────────────────────────────────────────────────
+-- FIX 10 (bonus): stores end-of-year per-subject outcome
+CREATE TABLE SubjectResult (
+    result_id    INT AUTO_INCREMENT PRIMARY KEY,
+    student_id   INT NOT NULL,
+    subject_id   INT NOT NULL,
+    semester_id  INT NOT NULL,
+    total_mark   DECIMAL(5,2) NOT NULL,
+    letter_grade VARCHAR(2)   NOT NULL,
+    passed       TINYINT(1)   NOT NULL DEFAULT 0,
+    UNIQUE KEY uq_result (student_id, subject_id, semester_id),
+    FOREIGN KEY (student_id)  REFERENCES Student(student_id)  ON DELETE CASCADE,
+    FOREIGN KEY (subject_id)  REFERENCES Subject(subject_id)  ON DELETE CASCADE,
+    FOREIGN KEY (semester_id) REFERENCES Semester(semester_id) ON DELETE CASCADE
+);
+
+-- ── Attendance ────────────────────────────────────────────────────
+CREATE TABLE Attendance (
+    attendance_id INT AUTO_INCREMENT PRIMARY KEY,
+    student_id    INT  NOT NULL,
+    date          DATE NOT NULL,
+    status        VARCHAR(10) NOT NULL,
+    semester_id   INT NOT NULL,
+    UNIQUE KEY uq_attendance (student_id, date),
+    FOREIGN KEY (student_id)  REFERENCES Student(student_id)  ON DELETE CASCADE,
+    FOREIGN KEY (semester_id) REFERENCES Semester(semester_id) ON DELETE CASCADE
+);
+
+-- ── GPA ───────────────────────────────────────────────────────────
+CREATE TABLE GPA (
+    gpa_id         INT AUTO_INCREMENT PRIMARY KEY,
+    student_id     INT NOT NULL,
+    school_year_id INT NOT NULL,
+    value          DECIMAL(3,2) CHECK (value BETWEEN 0.00 AND 4.00),
+    student_rank   INT,
+    UNIQUE KEY uq_gpa (student_id, school_year_id),
+    FOREIGN KEY (student_id)     REFERENCES Student(student_id)     ON DELETE CASCADE,
+    FOREIGN KEY (school_year_id) REFERENCES AcademicYear(school_year_id) ON DELETE CASCADE
+);
+
+-- ── User ──────────────────────────────────────────────────────────
+CREATE TABLE User (
+    user_id        INT AUTO_INCREMENT PRIMARY KEY,
+    user_name      VARCHAR(50)  NOT NULL UNIQUE,
+    password       VARCHAR(255) NOT NULL,
+    plain_password VARCHAR(100) NULL,           -- admin-only credential view
+    role           VARCHAR(20)  NOT NULL,
+    student_id     INT NULL,
+    teacher_id     INT NULL,
+    FOREIGN KEY (student_id) REFERENCES Student(student_id)  ON DELETE CASCADE,
+    FOREIGN KEY (teacher_id) REFERENCES Teacher(teacher_id)  ON DELETE CASCADE
+);
+
+-- ── Announcement ─────────────────────────────────────────────────
+-- FIX 8: table was missing
+CREATE TABLE Announcement (
+    announcement_id INT AUTO_INCREMENT PRIMARY KEY,
+    sender_id       INT NOT NULL,
+    title           VARCHAR(200) NOT NULL,
+    body            TEXT NOT NULL,
+    target_type     VARCHAR(20) NOT NULL,   -- 'all','students','teachers','class','student'
+    target_id       INT NULL,               -- class_id or student_id when targeted
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (sender_id) REFERENCES User(user_id) ON DELETE CASCADE
+);
+
+-- ── AnnouncementRead ─────────────────────────────────────────────
+CREATE TABLE AnnouncementRead (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    announcement_id INT NOT NULL,
+    user_id         INT NOT NULL,
+    read_at         DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_read (announcement_id, user_id),
+    FOREIGN KEY (announcement_id) REFERENCES Announcement(announcement_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id)         REFERENCES User(user_id)                  ON DELETE CASCADE
+);
+
+-- ── Seed: 6 academic years ────────────────────────────────────────
+INSERT IGNORE INTO AcademicYear (year_name) VALUES
+    ('2020-2021'),
+    ('2021-2022'),
+    ('2022-2023'),
+    ('2023-2024'),
+    ('2024-2025'),
+    ('2025-2026');
+
+-- ── Seed: semesters per year ─────────────────────────────────────
+-- FIX 2+3: use INSERT IGNORE (safe with UNIQUE key) + LIMIT 1 on subquery
+INSERT IGNORE INTO Semester (name, school_year_id) VALUES
+    ('Fall',   (SELECT school_year_id FROM AcademicYear WHERE year_name='2020-2021' LIMIT 1)),
+    ('Spring', (SELECT school_year_id FROM AcademicYear WHERE year_name='2020-2021' LIMIT 1)),
+    ('Fall',   (SELECT school_year_id FROM AcademicYear WHERE year_name='2021-2022' LIMIT 1)),
+    ('Spring', (SELECT school_year_id FROM AcademicYear WHERE year_name='2021-2022' LIMIT 1)),
+    ('Fall',   (SELECT school_year_id FROM AcademicYear WHERE year_name='2022-2023' LIMIT 1)),
+    ('Spring', (SELECT school_year_id FROM AcademicYear WHERE year_name='2022-2023' LIMIT 1)),
+    ('Fall',   (SELECT school_year_id FROM AcademicYear WHERE year_name='2023-2024' LIMIT 1)),
+    ('Spring', (SELECT school_year_id FROM AcademicYear WHERE year_name='2023-2024' LIMIT 1)),
+    ('Fall',   (SELECT school_year_id FROM AcademicYear WHERE year_name='2024-2025' LIMIT 1)),
+    ('Spring', (SELECT school_year_id FROM AcademicYear WHERE year_name='2024-2025' LIMIT 1)),
+    ('Fall',   (SELECT school_year_id FROM AcademicYear WHERE year_name='2025-2026' LIMIT 1)),
+    ('Spring', (SELECT school_year_id FROM AcademicYear WHERE year_name='2025-2026' LIMIT 1));
+
+-- Verify
+SHOW TABLES;
+SELECT COUNT(*) AS total_students FROM Student;
+
+
+-- ================================================================
+-- SECTION 1: ENROLLMENT & REGISTRATION MANAGEMENT
+-- ================================================================
+
+-- 1.1  Complete active student roster
+--      Admin: verify all students are placed at start of year
+SELECT
+    s.student_id,
+    CONCAT(s.f_name,' ',s.l_name)             AS student_name,
+    s.gender,
+    TIMESTAMPDIFF(YEAR,s.birth_date,CURDATE()) AS age,
+    CONCAT(c.grade,'-',c.section)              AS class,
+    s.enrollment_year,
+    CONCAT(g.f_name,' ',g.l_name)             AS guardian,
+    g.phone_no
+FROM Student s
+JOIN Class    c ON s.class_id    = c.class_id
+JOIN Guardian g ON s.guardian_id = g.guardian_id
+WHERE s.status = 'active'
+ORDER BY c.grade, c.section, s.l_name;
+
+
+-- 1.2  Students with no grades in the current (latest) semester
+--      Admin: identify students who slipped through registration
+SELECT
+    s.student_id,
+    CONCAT(s.f_name,' ',s.l_name) AS student_name,
+    CONCAT(c.grade,'-',c.section) AS class
+FROM Student s
+JOIN Class c ON s.class_id = c.class_id
+WHERE s.status = 'active'
+  AND NOT EXISTS (
+      SELECT 1 FROM Grades g
+      WHERE g.student_id  = s.student_id
+        AND g.semester_id = (SELECT MAX(semester_id) FROM Semester)
+  )
+ORDER BY c.grade, c.section;
+
+
+-- 1.3  Active students per class with capacity status
+--      Admin: resource planning and class balancing
+SELECT
+    CONCAT(c.grade,'-',c.section)   AS class,
+    CONCAT(t.f_name,' ',t.l_name)   AS homeroom_teacher,
+    COUNT(s.student_id)             AS active_students,
+    CASE
+        WHEN COUNT(s.student_id) < 15 THEN 'Under capacity'
+        WHEN COUNT(s.student_id) > 30 THEN 'Over capacity'
+        ELSE 'Normal'
+    END                             AS capacity_status
+FROM Class c
+LEFT JOIN Teacher t ON c.homeroom_teacher_id = t.teacher_id
+LEFT JOIN Student s ON s.class_id = c.class_id AND s.status = 'active'
+GROUP BY c.class_id, c.grade, c.section, t.f_name, t.l_name
+ORDER BY c.grade, c.section;
+
+
+-- 1.4  Students not enrolled in exactly 5 subjects this semester
+--      Admin: detect enrollment errors before grades are entered
+SELECT
+    s.student_id,
+    CONCAT(s.f_name,' ',s.l_name) AS student_name,
+    CONCAT(c.grade,'-',c.section) AS class,
+    COUNT(e.enrollment_id)        AS subjects_enrolled
+FROM Student s
+JOIN Class      c   ON s.class_id    = c.class_id
+JOIN Enrollment e   ON e.student_id  = s.student_id
+JOIN Subject    sub ON sub.subject_id = e.subject_id
+                   AND sub.semester_id = (SELECT MAX(semester_id) FROM Semester)
+WHERE s.status = 'active'
+GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+HAVING subjects_enrolled != 5
+ORDER BY subjects_enrolled, c.grade;
+
+
+-- ================================================================
+-- SECTION 2: ACADEMIC PERFORMANCE
+-- ================================================================
+
+-- 2.1  Full report card — one student, current semester
+--      Replace 1 with target student_id
+SELECT
+    sub.name                                                AS subject,
+    CONCAT(t.f_name,' ',t.l_name)                          AS teacher,
+    g.mark                                                  AS mark_pct,
+    g.status                                                AS letter_grade,
+    CASE WHEN sub.name = 'Physical Education'
+         THEN 'Excluded' ELSE 'Included' END                AS gpa_impact,
+    CASE WHEN g.mark >= 60 THEN 'PASS' ELSE 'FAIL' END     AS result
+FROM Grades g
+JOIN Subject sub ON g.subject_id  = sub.subject_id
+JOIN Teacher t   ON sub.teacher_id = t.teacher_id
+WHERE g.student_id  = 1                                     -- ← replace
+  AND g.semester_id = (SELECT MAX(semester_id) FROM Semester)
+ORDER BY gpa_impact DESC, sub.name;
+
+
+-- 2.2  Class ranking — current semester (PE excluded)
+--      Replace 1 with target class_id
+SELECT
+    RANK() OVER (ORDER BY ROUND(AVG(g.mark),2) DESC)  AS class_rank,
+    CONCAT(s.f_name,' ',s.l_name)                     AS student_name,
+    ROUND(AVG(g.mark),2)                              AS average_pct,
+    SUM(CASE WHEN g.status='F' THEN 1 ELSE 0 END)    AS failed_subjects,
+    CASE
+        WHEN AVG(g.mark) >= 85 THEN 'Excellent'
+        WHEN AVG(g.mark) >= 75 THEN 'Very Good'
+        WHEN AVG(g.mark) >= 65 THEN 'Good'
+        WHEN AVG(g.mark) >= 50 THEN 'Pass'
+        ELSE 'Fail'
+    END                                               AS standing
+FROM Grades g
+JOIN Student s   ON g.student_id  = s.student_id
+JOIN Subject sub ON g.subject_id  = sub.subject_id
+WHERE s.class_id    = 1                                     -- ← replace
+  AND g.semester_id = (SELECT MAX(semester_id) FROM Semester)
+  AND sub.name     != 'Physical Education'
+  AND s.status      = 'active'
+GROUP BY s.student_id, s.f_name, s.l_name
+ORDER BY class_rank;
+
+
+-- 2.3  At-risk list: failing 2 or more subjects this semester
+SELECT
+    CONCAT(s.f_name,' ',s.l_name)           AS student_name,
+    CONCAT(c.grade,'-',c.section)            AS class,
+    COUNT(CASE WHEN g.mark < 60 THEN 1 END) AS subjects_failed,
+    GROUP_CONCAT(
+        CASE WHEN g.mark < 60
+             THEN CONCAT(sub.name,' (',g.mark,'%)')
+        END ORDER BY g.mark SEPARATOR ' | '
+    )                                        AS failing_detail,
+    CONCAT(gu.f_name,' ',gu.l_name)         AS guardian,
+    gu.phone_no
+FROM Grades g
+JOIN Student  s  ON g.student_id  = s.student_id
+JOIN Class    c  ON s.class_id    = c.class_id
+JOIN Guardian gu ON s.guardian_id = gu.guardian_id
+JOIN Subject sub ON g.subject_id  = sub.subject_id
+WHERE g.semester_id = (SELECT MAX(semester_id) FROM Semester)
+  AND s.status = 'active'
+GROUP BY s.student_id, s.f_name, s.l_name,
+         c.grade, c.section, gu.f_name, gu.l_name, gu.phone_no
+HAVING subjects_failed >= 2
+ORDER BY subjects_failed DESC;
+
+
+-- 2.4  Grade distribution per subject — current semester
+SELECT
+    sub.name                                          AS subject,
+    COUNT(*)                                          AS students,
+    SUM(CASE WHEN g.status='A' THEN 1 ELSE 0 END)   AS A,
+    SUM(CASE WHEN g.status='B' THEN 1 ELSE 0 END)   AS B,
+    SUM(CASE WHEN g.status='C' THEN 1 ELSE 0 END)   AS C,
+    SUM(CASE WHEN g.status='D' THEN 1 ELSE 0 END)   AS D,
+    SUM(CASE WHEN g.status='F' THEN 1 ELSE 0 END)   AS F,
+    ROUND(AVG(g.mark),1)                             AS avg_pct,
+    MIN(g.mark)                                      AS lowest,
+    MAX(g.mark)                                      AS highest
+FROM Grades g
+JOIN Subject sub ON g.subject_id = sub.subject_id
+WHERE g.semester_id = (SELECT MAX(semester_id) FROM Semester)
+  AND sub.name     != 'Physical Education'
+GROUP BY sub.subject_id, sub.name
+ORDER BY avg_pct ASC;
+
+
+-- 2.5  Semester-over-semester improvement (Fall → Spring of latest year)
+SELECT
+    CONCAT(s.f_name,' ',s.l_name)  AS student_name,
+    CONCAT(c.grade,'-',c.section)  AS class,
+    ROUND(AVG(CASE WHEN g.semester_id = (SELECT MAX(semester_id)-1 FROM Semester)
+                   THEN g.mark END), 1) AS fall_avg,
+    ROUND(AVG(CASE WHEN g.semester_id = (SELECT MAX(semester_id) FROM Semester)
+                   THEN g.mark END), 1) AS spring_avg,
+    ROUND(
+        AVG(CASE WHEN g.semester_id = (SELECT MAX(semester_id)   FROM Semester) THEN g.mark END) -
+        AVG(CASE WHEN g.semester_id = (SELECT MAX(semester_id)-1 FROM Semester) THEN g.mark END)
+    , 1)                            AS change_value
+FROM Grades g
+JOIN Student s   ON g.student_id  = s.student_id
+JOIN Class   c   ON s.class_id    = c.class_id
+JOIN Subject sub ON g.subject_id  = sub.subject_id
+WHERE sub.name  != 'Physical Education'
+  AND s.status   = 'active'
+GROUP BY s.student_id, s.f_name, s.l_name, c.grade, c.section
+HAVING fall_avg IS NOT NULL AND spring_avg IS NOT NULL
+ORDER BY change_value DESC;
+
+
+-- 2.6  Annual GPA history for one student
+--      Replace 1 with target student_id
+SELECT
+    a.year_name,
+    gpa.value                AS annual_gpa,
+    gpa.student_rank         AS class_rank,
+    CASE
+        WHEN gpa.value >= 3.5 THEN 'Distinction'
+        WHEN gpa.value >= 3.0 THEN 'Merit'
+        WHEN gpa.value >= 2.0 THEN 'Pass'
+        ELSE 'At Risk'
+    END                      AS standing
+FROM GPA gpa
+JOIN AcademicYear a ON gpa.school_year_id = a.school_year_id
+WHERE gpa.student_id = 1    -- ← replace
+ORDER BY a.school_year_id;
+
+
+-- 2.7  Honour roll: top 10 students school-wide by latest GPA
+SELECT
+    RANK() OVER (ORDER BY gpa.value DESC) AS school_rank,
+    CONCAT(s.f_name,' ',s.l_name)        AS student_name,
+    CONCAT(c.grade,'-',c.section)         AS class,
+    gpa.value                             AS gpa
+FROM GPA gpa
+JOIN Student      s ON gpa.student_id     = s.student_id
+JOIN Class        c ON s.class_id         = c.class_id
+JOIN AcademicYear a ON gpa.school_year_id = a.school_year_id
+WHERE a.school_year_id = (SELECT MAX(school_year_id) FROM AcademicYear)
+  AND s.status = 'active'
+ORDER BY gpa.value DESC
+LIMIT 10;
+
+
+-- 2.8  Grade component breakdown — current semester detail
+--      Shows quiz1/quiz2/midterm/final for all students in a class
+--      Replace 1 with target class_id
+SELECT
+    CONCAT(s.f_name,' ',s.l_name)   AS student_name,
+    sub.name                         AS subject,
+    gd.quiz1,
+    gd.quiz2,
+    gd.midterm,
+    gd.final_exam,
+    gd.total                         AS raw_total_80,
+    g.mark                           AS percentage_100,
+    g.status                         AS letter_grade,
+    CASE WHEN gd.final_exam IS NULL
+         THEN 'Final Pending' ELSE 'Complete' END AS exam_status
+FROM Student s
+JOIN Enrollment  e   ON e.student_id  = s.student_id
+JOIN Subject     sub ON sub.subject_id = e.subject_id
+                    AND sub.semester_id = (SELECT MAX(semester_id) FROM Semester)
+LEFT JOIN GradeDetail gd ON gd.student_id  = s.student_id
+                        AND gd.subject_id  = sub.subject_id
+                        AND gd.semester_id = sub.semester_id
+LEFT JOIN Grades g       ON g.student_id   = s.student_id
+                        AND g.subject_id   = sub.subject_id
+                        AND g.semester_id  = sub.semester_id
+WHERE s.class_id = 1                                    -- ← replace
+  AND s.status   = 'active'
+  AND sub.name  != 'Physical Education'
+ORDER BY s.l_name, sub.name;
+
+
+-- ================================================================
+-- SECTION 3: ATTENDANCE MONITORING
+-- ================================================================
+
+-- 3.1  Students below 75% attendance with guardian contact
+SELECT
+    CONCAT(s.f_name,' ',s.l_name)    AS student_name,
+    CONCAT(c.grade,'-',c.section)    AS class,
+    COUNT(*)                         AS total_days,
+    SUM(CASE WHEN a.status='Absent'  THEN 1 ELSE 0 END) AS absences,
+    ROUND(
+        SUM(CASE WHEN a.status IN ('Present','Late','Excused') THEN 1 ELSE 0 END)
+        / COUNT(*) * 100, 1
+    )                                AS attendance_pct,
+    CONCAT(g.f_name,' ',g.l_name)   AS guardian,
+    g.phone_no
+FROM Attendance a
+JOIN Student  s ON a.student_id  = s.student_id
+JOIN Class    c ON s.class_id    = c.class_id
+JOIN Guardian g ON s.guardian_id = g.guardian_id
+WHERE a.semester_id = (SELECT MAX(semester_id) FROM Semester)
+  AND s.status = 'active'
+GROUP BY s.student_id, s.f_name, s.l_name,
+         c.grade, c.section, g.f_name, g.l_name, g.phone_no
+HAVING attendance_pct < 75
+ORDER BY attendance_pct ASC;
+
+
+-- 3.2  School-wide daily headcount for today
+SELECT
+    CONCAT(c.grade,'-',c.section)                         AS class,
+    COUNT(s.student_id)                                    AS total,
+    SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END)  AS present,
+    SUM(CASE WHEN a.status='Absent'  THEN 1 ELSE 0 END)  AS absent,
+    SUM(CASE WHEN a.status IS NULL   THEN 1 ELSE 0 END)  AS not_recorded,
+    ROUND(
+        SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END)
+        / COUNT(s.student_id) * 100, 1
+    )                                                      AS present_pct
+FROM Class c
+JOIN Student s    ON s.class_id = c.class_id AND s.status = 'active'
+LEFT JOIN Attendance a ON a.student_id = s.student_id AND a.date = CURDATE()
+GROUP BY c.class_id, c.grade, c.section
+ORDER BY c.grade, c.section;
+
+
+-- 3.3  Monthly attendance for one student — current semester
+--      Replace 1 with target student_id
+SELECT
+    DATE_FORMAT(a.date,'%Y-%m')                                     AS month,
+    COUNT(*)                                                        AS school_days,
+    SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END)           AS present,
+    SUM(CASE WHEN a.status='Absent'  THEN 1 ELSE 0 END)           AS absent,
+    SUM(CASE WHEN a.status='Late'    THEN 1 ELSE 0 END)           AS late,
+    ROUND(
+        SUM(CASE WHEN a.status IN ('Present','Late','Excused') THEN 1 ELSE 0 END)
+        / COUNT(*) * 100, 1
+    )                                                               AS monthly_pct
+FROM Attendance a
+WHERE a.student_id  = 1                                             -- ← replace
+  AND a.semester_id = (SELECT MAX(semester_id) FROM Semester)
+GROUP BY month
+ORDER BY month;
+
+
+-- ================================================================
+-- SECTION 4: TEACHER WORKLOAD & ASSIGNMENT
+-- ================================================================
+
+-- 4.1  Teaching load per teacher — current semester
+SELECT
+    CONCAT(t.f_name,' ',t.l_name)   AS teacher_name,
+    t.email,
+    COUNT(DISTINCT sub.subject_id)  AS subjects,
+    COUNT(DISTINCT s.class_id)      AS classes,
+    COUNT(DISTINCT e.student_id)    AS students_taught
+FROM Teacher t
+JOIN Subject    sub ON sub.teacher_id = t.teacher_id
+                   AND sub.semester_id = (SELECT MAX(semester_id) FROM Semester)
+JOIN Enrollment e   ON e.subject_id   = sub.subject_id
+JOIN Student    s   ON e.student_id   = s.student_id
+GROUP BY t.teacher_id, t.f_name, t.l_name, t.email
+ORDER BY students_taught DESC;
+
+
+-- 4.2  Homeroom teachers who also teach subjects (double duty)
+SELECT
+    CONCAT(t.f_name,' ',t.l_name)  AS teacher_name,
+    CONCAT(c.grade,'-',c.section)  AS homeroom_class,
+    COUNT(DISTINCT sub.subject_id) AS subjects_teaching,
+    COUNT(DISTINCT e.student_id)   AS total_students
+FROM Teacher t
+JOIN Class      c   ON c.homeroom_teacher_id = t.teacher_id
+JOIN Subject    sub ON sub.teacher_id = t.teacher_id
+                   AND sub.semester_id = (SELECT MAX(semester_id) FROM Semester)
+JOIN Enrollment e   ON e.subject_id = sub.subject_id
+GROUP BY t.teacher_id, t.f_name, t.l_name, c.class_id, c.grade, c.section
+ORDER BY total_students DESC;
+
+
+-- ================================================================
+-- SECTION 5: PAST STUDENTS
+-- ================================================================
+
+-- 5.1  Graduated students with final GPA
+SELECT
+    CONCAT(s.f_name,' ',s.l_name)  AS student_name,
+    CONCAT(c.grade,'-',c.section)  AS last_class,
+    s.enrollment_year,
+    gpa.value                      AS final_gpa,
+    gpa.student_rank               AS final_rank,
+    CASE
+        WHEN gpa.value >= 3.7 THEN 'With Distinction'
+        WHEN gpa.value >= 3.0 THEN 'With Merit'
+        ELSE 'Pass'
+    END                            AS graduation_standing
+FROM Student s
+JOIN Class c ON s.class_id = c.class_id
+LEFT JOIN GPA gpa ON gpa.student_id = s.student_id
+WHERE s.status = 'graduated'
+ORDER BY gpa.value DESC;
+
+
+-- 5.2  Withdrawn students with guardian contact
+SELECT
+    CONCAT(s.f_name,' ',s.l_name)  AS student_name,
+    CONCAT(c.grade,'-',c.section)  AS class_at_withdrawal,
+    s.enrollment_year,
+    CONCAT(g.f_name,' ',g.l_name)  AS guardian,
+    g.phone_no,
+    gpa.value                      AS last_gpa
+FROM Student s
+JOIN Class    c ON s.class_id    = c.class_id
+JOIN Guardian g ON s.guardian_id = g.guardian_id
+LEFT JOIN GPA gpa ON gpa.student_id = s.student_id
+WHERE s.status = 'withdrawn'
+ORDER BY s.l_name;
+
+
+-- 5.3  Enrollment trend by year
+SELECT
+    s.enrollment_year,
+    COUNT(*)                                                  AS total_enrolled,
+    SUM(CASE WHEN s.status='active'    THEN 1 ELSE 0 END)    AS currently_active,
+    SUM(CASE WHEN s.status='graduated' THEN 1 ELSE 0 END)    AS graduated,
+    SUM(CASE WHEN s.status='withdrawn' THEN 1 ELSE 0 END)    AS withdrawn
+FROM Student s
+GROUP BY s.enrollment_year
+ORDER BY s.enrollment_year;
+
+
+-- ================================================================
+-- SECTION 6: SCHOOL KPI SUMMARY
+-- ================================================================
+
+-- 6.1  Full school snapshot — one row
+SELECT
+    (SELECT COUNT(*) FROM Student WHERE status='active')                      AS active_students,
+    (SELECT COUNT(*) FROM Student WHERE status='graduated')                   AS graduated,
+    (SELECT COUNT(*) FROM Student WHERE status='withdrawn')                   AS withdrawn,
+    (SELECT COUNT(*) FROM Teacher)                                             AS teachers,
+    (SELECT COUNT(*) FROM Class)                                               AS classes,
+    (SELECT ROUND(AVG(value),2) FROM GPA
+     WHERE school_year_id=(SELECT MAX(school_year_id) FROM AcademicYear))      AS avg_school_gpa,
+    (SELECT COUNT(*) FROM Grades g2
+     JOIN Subject sub2 ON g2.subject_id = sub2.subject_id
+     WHERE g2.mark < 60
+       AND sub2.name != 'Physical Education'
+       AND g2.semester_id = (SELECT MAX(semester_id) FROM Semester))           AS failing_this_semester,
+    (SELECT COUNT(*) FROM Announcement)                                        AS total_announcements,
+    (SELECT COUNT(*) FROM GradeDetail
+     WHERE final_exam IS NULL
+       AND semester_id = (SELECT MAX(semester_id) FROM Semester))              AS finals_still_pending;
+
+
+-- 6.2  Average GPA per class — latest year
+SELECT
+    CONCAT(c.grade,'-',c.section)   AS class,
+    CONCAT(t.f_name,' ',t.l_name)   AS homeroom_teacher,
+    COUNT(gpa.student_id)           AS students,
+    ROUND(AVG(gpa.value),2)         AS avg_gpa,
+    MAX(gpa.value)                  AS top_gpa,
+    MIN(gpa.value)                  AS lowest_gpa,
+    CASE
+        WHEN AVG(gpa.value) >= 3.0 THEN 'High Performing'
+        WHEN AVG(gpa.value) >= 2.0 THEN 'Average'
+        ELSE 'Needs Support'
+    END                             AS performance_band
+FROM Class c
+JOIN Student      s   ON s.class_id            = c.class_id
+JOIN GPA          gpa ON gpa.student_id        = s.student_id
+JOIN Teacher      t   ON c.homeroom_teacher_id = t.teacher_id
+WHERE gpa.school_year_id = (SELECT MAX(school_year_id) FROM AcademicYear)
+  AND s.status = 'active'
+GROUP BY c.class_id, c.grade, c.section, t.f_name, t.l_name
+ORDER BY avg_gpa DESC;
+
+
+-- ================================================================
+-- SECTION 7: USER ACCOUNT MANAGEMENT
+-- ================================================================
+
+-- 7.1  All user accounts with linked identity
+SELECT
+    u.user_id, u.user_name, u.role,
+    CASE
+        WHEN u.role = 'student'
+             THEN CONCAT(s.f_name,' ',s.l_name,' | Grade ',c.grade,'-',c.section)
+        WHEN u.role = 'teacher'
+             THEN CONCAT(t.f_name,' ',t.l_name)
+        WHEN u.role = 'admin'   THEN 'System Administrator'
+        ELSE 'Unlinked'
+    END AS identity
+FROM User u
+LEFT JOIN Student s ON u.student_id = s.student_id
+LEFT JOIN Class   c ON s.class_id   = c.class_id
+LEFT JOIN Teacher t ON u.teacher_id = t.teacher_id
+ORDER BY u.role, u.user_name;
+
+
+-- 7.2  Student login credentials — admin only
+SELECT
+    CONCAT(s.f_name,' ',s.l_name)  AS student_name,
+    CONCAT(c.grade,'-',c.section)  AS class,
+    u.user_name,
+    u.plain_password               AS password
+FROM User u
+JOIN Student s ON u.student_id = s.student_id
+JOIN Class   c ON s.class_id   = c.class_id
+WHERE u.role = 'student'
+ORDER BY c.grade, c.section, s.l_name;
+
+
+-- 7.3  Orphaned accounts — no linked student or teacher
+SELECT user_id, user_name, role
+FROM User
+WHERE role NOT IN ('admin')
+  AND student_id IS NULL
+  AND teacher_id IS NULL;
